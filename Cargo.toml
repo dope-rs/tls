@@ -1,0 +1,31 @@
+[package]
+name = "dope-tls"
+version = "0.3.0"
+edition = "2024"
+description = "TCP TLS streams for dope runtime, shin-backed"
+license = "MIT"
+repository = "https://github.com/dope-rs/tls"
+readme = "README.md"
+
+[dependencies]
+shin = "0.1.0"
+dope = "0.3"
+o3 = "0.1"
+libc = "0.2"
+webpki-roots = "1.0"
+rustls-pki-types = "1"
+
+[dev-dependencies]
+ring = "0.17"
+rcgen = "0.14"
+
+[lints.rust]
+rust_2024_compatibility = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "deny"
+dead_code = "deny"
+unused_imports = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+missing_safety_doc = "allow"
