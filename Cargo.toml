@@ -8,12 +8,16 @@ repository = "https://github.com/dope-rs/tls"
 readme = "README.md"
 
 [dependencies]
-shin = "0.1.0"
+shin = "0.2"
 dope = "0.3"
 o3 = "0.1"
 libc = "0.2"
 webpki-roots = "1.0"
 rustls-pki-types = "1"
+rustls = { version = "0.23", optional = true }
+
+[features]
+rustls = ["dep:rustls"]
 
 [dev-dependencies]
 ring = "0.17"

@@ -38,6 +38,7 @@ pub enum Error {
     Io(std::io::Error),
     PlaintextAlert { level: u8, desc: u8 },
     Overflow,
+    SendOverflow,
 }
 
 impl From<RecordError> for Error {
@@ -52,7 +53,8 @@ impl PartialEq for Error {
             (Self::Other, Self::Other)
             | (Self::UnexpectedRecord, Self::UnexpectedRecord)
             | (Self::NotEstablished, Self::NotEstablished)
-            | (Self::Overflow, Self::Overflow) => true,
+            | (Self::Overflow, Self::Overflow)
+            | (Self::SendOverflow, Self::SendOverflow) => true,
             (Self::Record(a), Self::Record(b)) => a == b,
             (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
             (
@@ -109,7 +111,10 @@ impl State {
 
     fn seal_app(&mut self, ct: ContentType, data: &[u8]) -> Result<(), Error> {
         let sealer = self.app_sealer.as_mut().ok_or(Error::NotEstablished)?;
-        let wire = sealer.seal(ct, data);
+        let wire = sealer.seal(ct, data)?;
+        if self.pending_send.spare_capacity() < wire.len() {
+            return Err(Error::SendOverflow);
+        }
         self.pending_send.push(&wire);
         Ok(())
     }
@@ -119,7 +124,10 @@ impl State {
             .handshake_sealer
             .as_mut()
             .ok_or(Error::UnexpectedRecord)?;
-        let wire = sealer.seal(ContentType::Handshake, data);
+        let wire = sealer.seal(ContentType::Handshake, data)?;
+        if self.pending_send.spare_capacity() < wire.len() {
+            return Err(Error::SendOverflow);
+        }
         self.pending_send.push(&wire);
         Ok(())
     }
@@ -393,6 +401,9 @@ impl State {
                     Epoch::Plaintext => {
                         let mut tmp: Vec<u8> = Vec::with_capacity(HEADER_LEN + data.len());
                         PlaintextRecord::encode(ContentType::Handshake, &data, &mut tmp);
+                        if self.pending_send.spare_capacity() < tmp.len() {
+                            return Err(Error::SendOverflow);
+                        }
                         self.pending_send.push(&tmp);
                     }
                     Epoch::Handshake => self.seal_handshake(&data)?,
@@ -483,5 +494,90 @@ mod handshake_reassembly_tests {
         buf.extend(msg(15, 260));
         buf.extend(msg(20, 36));
         assert_eq!(State::complete_handshake_prefix(&buf), buf.len());
+    }
+}
+
+#[cfg(test)]
+mod send_overflow_tests {
+    use super::{ContentType, Error, SEND_CAP, State};
+    use ring::rand::{SecureRandom, SystemRandom};
+    use shin::sig::SigningKey;
+
+    fn signing_key() -> SigningKey {
+        let mut seed = [0u8; 32];
+        SystemRandom::new().fill(&mut seed).unwrap();
+        SigningKey::from_seed(&seed).unwrap()
+    }
+
+    fn pump(client: &mut State, server: &mut State) {
+        for _ in 0..10 {
+            let from_client = client.pull_send();
+            let from_server = server.pull_send();
+            let progressed = !from_client.is_empty() || !from_server.is_empty();
+            if !from_client.is_empty() {
+                server.read_tcp(&from_client).expect("server.read_tcp");
+            }
+            if !from_server.is_empty() {
+                client.read_tcp(&from_server).expect("client.read_tcp");
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    fn established_pair() -> (State, State) {
+        let signing = signing_key();
+        let server_pubkey = *signing.pubkey();
+        let mut server = State::new_server(shin::server::Config {
+            source: shin::server::CertSource::RawPublicKey {
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_secret: None,
+            accept_early_data: false,
+        });
+        let mut client = State::new_client(shin::client::Config {
+            verifier: shin::client::Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
+        })
+        .unwrap();
+        pump(&mut client, &mut server);
+        assert!(client.is_established() && server.is_established());
+        (client, server)
+    }
+
+    // A near-full `pending_send` must make the next seal return Err(SendOverflow)
+    // instead of panicking inside `Rolling::push`'s overflow assert.
+    #[test]
+    fn seal_app_returns_err_when_pending_send_nearly_full() {
+        let (mut client, _server) = established_pair();
+
+        // Fill pending_send so that only a handful of bytes remain free, far
+        // less than a sealed application record needs.
+        client.pending_send.consume(client.pending_send.as_slice().len());
+        let chunk = [0u8; 4096];
+        while client.pending_send.spare_capacity() > 8 {
+            let take = chunk.len().min(client.pending_send.spare_capacity());
+            client.pending_send.push(&chunk[..take]);
+        }
+        assert!(client.pending_send.spare_capacity() <= 8);
+        assert!(client.pending_send.spare_capacity() < SEND_CAP);
+
+        // This would overflow the 64 KiB buffer; old code panics in push().
+        let err = client
+            .seal_app(ContentType::ApplicationData, b"hello world")
+            .unwrap_err();
+        assert_eq!(err, Error::SendOverflow);
+
+        // The same guard protects the handshake-seal response path.
+        let err = client.seal_handshake(b"hello world").unwrap_err();
+        assert_eq!(err, Error::SendOverflow);
     }
 }
