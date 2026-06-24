@@ -9,7 +9,7 @@ const RECV_CAP: usize = 32 * 1024;
 const SEND_CAP: usize = 64 * 1024;
 
 const INCOMING_APP_CAP: usize = 1 << 20;
-const HS_REASSEMBLY_CAP: usize = 1 << 16;
+const HS_REASSEMBLY_CAP: usize = 1 << 18;
 
 const ALERT_LEVEL_FATAL: u8 = 2;
 const ALERT_RECORD_OVERFLOW: u8 = 22;
@@ -302,6 +302,9 @@ impl State {
     }
 
     fn handle_handshake_plaintext(&mut self, total: usize) -> Result<bool, Error> {
+        if total > HEADER_LEN + MAX_PLAINTEXT_BODY {
+            return Err(Error::Record(RecordError::BodyTooLarge));
+        }
         let view = self.recv_buf.as_slice();
         let (rec, consumed) =
             PlaintextRecord::parse(&view[..total])?.ok_or(Error::UnexpectedRecord)?;
@@ -400,7 +403,7 @@ impl State {
                 Event::Send { epoch, data } => match epoch {
                     Epoch::Plaintext => {
                         let mut tmp: Vec<u8> = Vec::with_capacity(HEADER_LEN + data.len());
-                        PlaintextRecord::encode(ContentType::Handshake, &data, &mut tmp);
+                        PlaintextRecord::encode(ContentType::Handshake, &data, &mut tmp)?;
                         if self.pending_send.spare_capacity() < tmp.len() {
                             return Err(Error::SendOverflow);
                         }
@@ -528,7 +531,7 @@ mod send_overflow_tests {
 
     fn established_pair() -> (State, State) {
         let signing = signing_key();
-        let server_pubkey = *signing.pubkey();
+        let server_pubkey = *signing.pubkey().unwrap();
         let mut server = State::new_server(shin::server::Config {
             source: shin::server::CertSource::RawPublicKey {
                 signing_key: signing,

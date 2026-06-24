@@ -27,7 +27,7 @@ fn pump(client: &mut State, server: &mut State) {
 
 fn established_pair() -> (State, State) {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
@@ -55,7 +55,7 @@ fn established_pair() -> (State, State) {
 #[test]
 fn server_to_client_key_update_no_request_rotates_only_reader() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,

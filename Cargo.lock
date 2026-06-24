@@ -156,9 +156,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eff6d6291d502fcfe3be40056f22d81e75552132fbc6d882a973e4a959af906"
+checksum = "dac60a84b25b25e6f60188191f1300827560150c8ed78fc021cea2a2e2a8401e"
 dependencies = [
  "io-uring",
  "libc",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dope",
  "libc",
@@ -506,9 +506,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d1d4afa026464f10e36212fcbb3201a87246401252941cbfa83c0668f6c5c82"
+checksum = "f0b21d2e2065583b7ce4bd647cf610ef2b3c372180736128c0d8485997a5d297"
 dependencies = [
  "ring",
  "subtle",

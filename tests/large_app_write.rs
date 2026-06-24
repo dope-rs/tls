@@ -28,7 +28,7 @@ fn pump(client: &mut State, server: &mut State) {
 #[test]
 fn large_app_write_fragments_without_panic() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
@@ -79,7 +79,7 @@ fn large_app_write_fragments_without_panic() {
 #[test]
 fn oversized_app_write_backpressures_without_panic() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,

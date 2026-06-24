@@ -1,7 +1,7 @@
 use dope_tls::{State, WebpkiRoots};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use shin::asn1::{Reader, Tag};
-use shin::cert::Cert;
+use shin::cert::{Cert, SubjectPublicKeyInfo};
 use shin::client::{OwnedTrustAnchor, Verifier};
 use shin::server::CertSource;
 use shin::sig::SigningKey;
@@ -68,6 +68,25 @@ fn webpki_roots_returns_nonempty_anchor_pool() {
     for ta in &pool {
         assert!(!ta.subject_der.is_empty());
         assert!(!ta.spki_der.is_empty());
+    }
+}
+
+#[test]
+fn webpki_roots_spki_round_trips_through_verifier_parse() {
+    let pool = WebpkiRoots::anchors();
+    assert!(!pool.is_empty());
+    for ta in &pool {
+        let spki = SubjectPublicKeyInfo::parse_standalone(&ta.spki_der).unwrap_or_else(|e| {
+            panic!("anchor SPKI failed to parse: {e:?}");
+        });
+        assert!(
+            !spki.algorithm.oid.is_empty(),
+            "anchor SPKI missing algorithm OID"
+        );
+        assert!(
+            !spki.subject_public_key.is_empty(),
+            "anchor SPKI missing public key bytes"
+        );
     }
 }
 

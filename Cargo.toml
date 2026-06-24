@@ -1,6 +1,6 @@
 [package]
 name = "dope-tls"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "TCP TLS streams for dope runtime, shin-backed"
 license = "MIT"
@@ -8,8 +8,8 @@ repository = "https://github.com/dope-rs/tls"
 readme = "README.md"
 
 [dependencies]
-shin = "0.2"
-dope = "0.3"
+shin = "0.3"
+dope = "0.4"
 o3 = "0.1"
 libc = "0.2"
 webpki-roots = "1.0"

@@ -12,6 +12,7 @@ use crate::state::State;
 const TLS_PLAIN_CAP: usize = 16 * 1024;
 const TLS_WIRE_CAP: usize = 32 * 1024;
 const PENDING_APP_CAP: usize = 1 << 20;
+const INGRESS_CAP: usize = 1 << 20;
 
 pub struct ConnState {
     pub tls: Option<State>,
@@ -41,12 +42,18 @@ pub struct Tls {
     state: ConnState,
     ingress: Vec<u8>,
     egress: Rolling<TLS_WIRE_CAP>,
+    // True while a send referencing egress is in flight; egress must not move.
+    send_inflight: bool,
 }
 
 impl Tls {
     fn ingress_decrypt(&mut self, wire_in: &[u8]) {
         match self.state.tls.as_mut() {
             None => {
+                if self.ingress.len() + wire_in.len() > INGRESS_CAP {
+                    self.state.close = true;
+                    return;
+                }
                 self.ingress.extend_from_slice(wire_in);
             }
             Some(tls) => {
@@ -135,6 +142,9 @@ impl Tls {
     }
 
     fn drain_to_egress(&mut self) {
+        if self.send_inflight {
+            return;
+        }
         let spare = self.egress.spare_capacity();
         if spare == 0 {
             return;
@@ -149,7 +159,7 @@ impl Tls {
         }
     }
 
-    fn submit_wire_buf(&self, core: &mut Core, ud: Token, driver: &mut Driver) {
+    fn submit_wire_buf(&mut self, core: &mut Core, ud: Token, driver: &mut Driver) {
         if core.is_send_inflight() {
             return;
         }
@@ -158,6 +168,7 @@ impl Tls {
             return;
         }
         core.submit_single(ud, wire, driver);
+        self.send_inflight = true;
     }
 
     fn propagate_close(&self, core: &mut Core) {
@@ -185,6 +196,7 @@ impl Wire for Tls {
             state: s,
             ingress: Vec::with_capacity(TLS_PLAIN_CAP),
             egress: Rolling::default(),
+            send_inflight: false,
         }
     }
 
@@ -249,6 +261,7 @@ impl Wire for Tls {
         ud: Token,
         driver: &mut Driver,
     ) -> bool {
+        self.send_inflight = false;
         self.egress.consume(n);
         self.drain_to_egress();
         if self.egress.is_empty() {

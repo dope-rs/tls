@@ -154,6 +154,8 @@ pub struct RustlsTls {
     /// Ciphertext that did not fit into `egress` on the last drain. Flushed back
     /// into `egress` (front of the queue) before pulling new ciphertext.
     tail: Vec<u8>,
+    // True while a send referencing egress is in flight; egress must not move.
+    send_inflight: bool,
 }
 
 impl RustlsTls {
@@ -257,6 +259,9 @@ impl RustlsTls {
     ///
     /// No socket I/O happens here; that is deferred to `submit_wire_buf`.
     fn drain_to_egress(&mut self) {
+        if self.send_inflight {
+            return;
+        }
         // First, flush any carried-over tail into egress.
         self.flush_tail();
         let mut scratch: Vec<u8> = Vec::new();
@@ -317,7 +322,7 @@ impl RustlsTls {
 
     /// Move buffered `tail` ciphertext into `egress` as room becomes available.
     fn flush_tail(&mut self) {
-        if self.tail.is_empty() {
+        if self.send_inflight || self.tail.is_empty() {
             return;
         }
         let spare = self.egress.spare_capacity();
@@ -467,6 +472,7 @@ impl RustlsTls {
             return;
         }
         core.submit_single(ud, wire, driver);
+        self.send_inflight = true;
     }
 
     fn propagate_close(&mut self, core: &mut Core, ud: Token, driver: &mut Driver) {
@@ -518,6 +524,7 @@ impl Wire for RustlsTls {
             ingress: Vec::with_capacity(TLS_PLAIN_CAP),
             egress: Rolling::default(),
             tail: Vec::new(),
+            send_inflight: false,
         };
         // A client immediately produces a ClientHello; stage it.
         me.drain_to_egress();
@@ -588,6 +595,7 @@ impl Wire for RustlsTls {
         ud: Token,
         driver: &mut Driver,
     ) -> bool {
+        self.send_inflight = false;
         self.egress.consume(n);
         self.drain_to_egress();
         if self.egress.is_empty() {

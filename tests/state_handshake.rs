@@ -28,7 +28,7 @@ fn pump(client: &mut State, server: &mut State) {
 #[test]
 fn handshake_completes_in_process() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
@@ -61,7 +61,7 @@ fn handshake_completes_in_process() {
 #[test]
 fn application_data_round_trip() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
@@ -103,7 +103,7 @@ fn application_data_round_trip() {
 #[test]
 fn close_notify_round_trip_closes_peer() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
@@ -140,7 +140,7 @@ fn close_notify_round_trip_closes_peer() {
 #[test]
 fn close_notify_before_handshake_rejected() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut client = State::new_client(shin::client::Config {
         verifier: shin::client::Verifier::RawPublicKey {
             expected_pubkey: server_pubkey,
@@ -161,7 +161,7 @@ fn close_notify_before_handshake_rejected() {
 #[test]
 fn close_notify_idempotent() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
@@ -189,7 +189,7 @@ fn close_notify_idempotent() {
 #[test]
 fn write_app_before_handshake_rejected() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut client = State::new_client(shin::client::Config {
         verifier: shin::client::Verifier::RawPublicKey {
             expected_pubkey: server_pubkey,
@@ -210,7 +210,7 @@ fn write_app_before_handshake_rejected() {
 #[test]
 fn multiple_application_records_round_trip_in_order() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
@@ -252,7 +252,7 @@ fn multiple_application_records_round_trip_in_order() {
 #[test]
 fn fragmented_tcp_input_is_buffered_correctly() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let mut server = State::new_server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,

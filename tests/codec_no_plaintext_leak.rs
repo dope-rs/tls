@@ -11,7 +11,7 @@ fn signing_key() -> SigningKey {
 #[test]
 fn tls_egress_produces_tls_record_not_plaintext() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let cfg = shin::client::Config {
         verifier: shin::client::Verifier::RawPublicKey {
             expected_pubkey: server_pubkey,
@@ -38,7 +38,7 @@ fn tls_egress_produces_tls_record_not_plaintext() {
 #[test]
 fn tls_egress_handshake_then_app_record() {
     let signing = signing_key();
-    let server_pubkey = *signing.pubkey();
+    let server_pubkey = *signing.pubkey().unwrap();
     let server_cfg = shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
