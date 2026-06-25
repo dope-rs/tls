@@ -6,12 +6,12 @@ use dope::Driver;
 use dope::runtime::token::Token;
 use dope::transport::link::Core;
 use dope::wire::{Reclaim, RecvChunk, Vectored, Wire};
-use o3::buffer::Rolling;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 use shin::record::MAX_PLAINTEXT_BODY;
 
-use crate::staging::{MAX_TLS_RECORD, TLS_STAGING_CAP, boxed_rolling};
+use crate::pool::Pooled;
+use crate::staging::MAX_TLS_RECORD;
 
 const PENDING_APP_CAP: usize = 1 << 20;
 /// Hard cap on the egress overflow `tail`. Ciphertext production is gated on
@@ -143,8 +143,7 @@ pub struct RustTls {
     /// Decrypted application plaintext, surfaced via `process_recv` for the
     /// `RustTlsEndpoint::None` path (kept for symmetry with the shin wire).
     ingress: Vec<u8>,
-    /// Boxed so the inline wire (in every pool slab slot) stays small.
-    egress: Box<Rolling<TLS_STAGING_CAP>>,
+    egress: Pooled,
     /// Ciphertext that did not fit into `egress` on the last drain. Flushed back
     /// into `egress` (front of the queue) before pulling new ciphertext.
     tail: Vec<u8>,
@@ -494,12 +493,6 @@ impl RustTls {
     }
 }
 
-impl Drop for RustTls {
-    fn drop(&mut self) {
-        crate::memstats::egress_release();
-    }
-}
-
 impl Wire for RustTls {
     type InitConfig = RustTlsEndpoint;
 
@@ -519,14 +512,11 @@ impl Wire for RustTls {
         };
         s.close = conn.is_none();
         s.conn = conn;
-        // egress box allocated below; rustls owns its own recv/send buffers, so
-        // this backend reports only egress.
-        crate::memstats::egress_borrow();
+        // rustls owns its own recv/send buffers, so this backend pools only egress.
         let mut me = Self {
             state: s,
-            // Lazy: only the no-TLS passthrough path fills `ingress`.
             ingress: Vec::new(),
-            egress: boxed_rolling(),
+            egress: Pooled::egress(),
             tail: Vec::new(),
             send_inflight: false,
         };
@@ -603,6 +593,7 @@ impl Wire for RustTls {
         self.egress.consume(n);
         self.drain_to_egress();
         if self.egress.is_empty() {
+            self.egress.release_if_empty();
             self.propagate_close(core, ud, driver);
             return false;
         }

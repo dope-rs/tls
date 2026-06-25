@@ -1,6 +1,6 @@
 [package]
 name = "dope-tls"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "TCP TLS streams for dope runtime, shin-backed"
 license = "MIT"
@@ -9,7 +9,6 @@ readme = "README.md"
 
 [dependencies]
 shin = "0.3"
-# 0.4.2 first ships the `memstats` module the `mem-stats` feature forwards into.
 dope = "0.4.2"
 o3 = "0.1"
 libc = "0.2"
@@ -19,7 +18,6 @@ rustls = { version = "0.23", optional = true }
 
 [features]
 rustls = ["dep:rustls"]
-# Forwards the TLS staging boxes into dope's per-thread HWM counters. Default OFF.
 mem-stats = ["dope/mem-stats"]
 
 [dev-dependencies]

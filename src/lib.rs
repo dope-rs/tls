@@ -1,4 +1,5 @@
 mod memstats;
+mod pool;
 mod staging;
 pub mod state;
 pub mod webpki_roots;

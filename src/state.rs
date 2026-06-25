@@ -1,16 +1,10 @@
-use o3::buffer::Rolling;
 use shin::record::{
     AEAD_TAG_LEN, ContentType, HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY, Opener,
     PlaintextRecord, RecordError, Sealer,
 };
 use shin::{Epoch, Event, KeyDirection};
 
-use crate::staging::{TLS_STAGING_CAP, boxed_rolling};
-
-// One record at a time; multi-record handshake flights reassemble in the
-// separate `hs_reassembly`, so these only ever need room for one record.
-const RECV_CAP: usize = TLS_STAGING_CAP;
-const SEND_CAP: usize = TLS_STAGING_CAP;
+use crate::pool::Pooled;
 
 const INCOMING_APP_CAP: usize = 1 << 20;
 const HS_REASSEMBLY_CAP: usize = 1 << 18;
@@ -90,8 +84,8 @@ pub struct State {
     app_sealer: Option<Sealer>,
     app_opener: Option<Opener>,
 
-    recv_buf: Box<Rolling<RECV_CAP>>,
-    pending_send: Box<Rolling<SEND_CAP>>,
+    recv_buf: Pooled,
+    pending_send: Pooled,
     incoming_app: Vec<u8>,
     hs_reassembly: Vec<u8>,
 
@@ -137,8 +131,6 @@ impl State {
     }
 
     fn empty(side: Side) -> Self {
-        crate::memstats::recv_borrow();
-        crate::memstats::send_borrow();
         Self {
             side,
             phase: Phase::Handshaking,
@@ -146,8 +138,8 @@ impl State {
             handshake_opener: None,
             app_sealer: None,
             app_opener: None,
-            recv_buf: boxed_rolling(),
-            pending_send: boxed_rolling(),
+            recv_buf: Pooled::recv(),
+            pending_send: Pooled::send(),
             incoming_app: Vec::new(),
             hs_reassembly: Vec::new(),
             handshake_keys_ready: false,
@@ -164,6 +156,8 @@ impl State {
             }
             while self.consume_one_record()? {}
             if rest.is_empty() {
+                // Empty unless a split record is still pending reassembly.
+                self.recv_buf.release_if_empty();
                 return Ok(());
             }
             if take == 0 {
@@ -182,12 +176,14 @@ impl State {
 
     pub fn consume_pending_send(&mut self, n: usize) {
         self.pending_send.consume(n);
+        self.pending_send.release_if_empty();
     }
 
     pub fn pull_send(&mut self) -> Vec<u8> {
         let v = self.pending_send.as_slice().to_vec();
         let n = v.len();
         self.pending_send.consume(n);
+        self.pending_send.release_if_empty();
         v
     }
 
@@ -454,25 +450,21 @@ impl State {
     }
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        crate::memstats::recv_release();
-        crate::memstats::send_release();
-    }
-}
-
 #[cfg(test)]
 mod buffer_sizing_tests {
-    use super::{RECV_CAP, SEND_CAP};
-    use crate::staging::MAX_TLS_RECORD;
+    use crate::staging::{MAX_TLS_RECORD, TLS_STAGING_CAP};
 
     #[test]
     fn recv_send_caps_are_right_sized() {
         const {
-            assert!(RECV_CAP >= MAX_TLS_RECORD, "recv must fit one full record");
-            assert!(SEND_CAP >= MAX_TLS_RECORD, "send must fit one full record");
-            assert!(SEND_CAP <= 32 * 1024, "send must not be a bulk buffer");
-            assert!(RECV_CAP <= 32 * 1024, "recv must not be a bulk buffer");
+            assert!(
+                TLS_STAGING_CAP >= MAX_TLS_RECORD,
+                "staging must fit one full record"
+            );
+            assert!(
+                TLS_STAGING_CAP <= 32 * 1024,
+                "staging must not be a bulk buffer"
+            );
         }
     }
 }
@@ -534,7 +526,8 @@ mod send_overflow_tests {
     use ring::rand::{SecureRandom, SystemRandom};
     use shin::sig::SigningKey;
 
-    use super::{ContentType, Error, SEND_CAP, State};
+    use super::{ContentType, Error, State};
+    use crate::staging::TLS_STAGING_CAP;
 
     fn signing_key() -> SigningKey {
         let mut seed = [0u8; 32];
@@ -603,7 +596,7 @@ mod send_overflow_tests {
             client.pending_send.push(&chunk[..take]);
         }
         assert!(client.pending_send.spare_capacity() <= 8);
-        assert!(client.pending_send.spare_capacity() < SEND_CAP);
+        assert!(client.pending_send.spare_capacity() < TLS_STAGING_CAP);
 
         // This would overflow the 64 KiB buffer; old code panics in push().
         let err = client

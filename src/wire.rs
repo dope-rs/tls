@@ -4,10 +4,10 @@ use dope::Driver;
 use dope::runtime::token::Token;
 use dope::transport::link::Core;
 use dope::wire::{Reclaim, RecvChunk, Vectored, Wire};
-use o3::buffer::Rolling;
 use shin::record::MAX_PLAINTEXT_BODY;
 
-use crate::staging::{MAX_TLS_RECORD, TLS_STAGING_CAP, boxed_rolling};
+use crate::pool::Pooled;
+use crate::staging::MAX_TLS_RECORD;
 use crate::state::State;
 
 const PENDING_APP_CAP: usize = 1 << 20;
@@ -40,8 +40,7 @@ pub enum Endpoint {
 pub struct Tls {
     state: ConnState,
     ingress: Vec<u8>,
-    // Boxed so the inline wire (in every pool slab slot) stays small.
-    egress: Box<Rolling<TLS_STAGING_CAP>>,
+    egress: Pooled,
     // True while a send referencing egress is in flight; egress must not move.
     send_inflight: bool,
 }
@@ -178,12 +177,6 @@ impl Tls {
     }
 }
 
-impl Drop for Tls {
-    fn drop(&mut self) {
-        crate::memstats::egress_release();
-    }
-}
-
 impl Wire for Tls {
     type InitConfig = Endpoint;
 
@@ -198,14 +191,10 @@ impl Wire for Tls {
         };
         s.close = tls.is_none();
         s.tls = tls;
-        // egress box, allocated below for every wire (recv/send are counted per
-        // `State` in `State::empty`).
-        crate::memstats::egress_borrow();
         Self {
             state: s,
-            // Lazy: only the no-TLS passthrough path fills `ingress`.
             ingress: Vec::new(),
-            egress: boxed_rolling(),
+            egress: Pooled::egress(),
             send_inflight: false,
         }
     }
@@ -275,6 +264,7 @@ impl Wire for Tls {
         self.egress.consume(n);
         self.drain_to_egress();
         if self.egress.is_empty() {
+            self.egress.release_if_empty();
             self.propagate_close(core);
             return false;
         }
@@ -295,6 +285,7 @@ mod buffer_sizing_tests {
     use shin::sig::SigningKey;
 
     use super::*;
+    use crate::staging::TLS_STAGING_CAP;
 
     fn server_endpoint() -> Endpoint {
         let mut seed = [0u8; 32];
