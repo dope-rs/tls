@@ -1,6 +1,6 @@
 [package]
 name = "dope-tls"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "TCP TLS streams for dope runtime, shin-backed"
 license = "MIT"
@@ -9,7 +9,8 @@ readme = "README.md"
 
 [dependencies]
 shin = "0.3"
-dope = "0.4"
+# 0.4.2 first ships the `memstats` module the `mem-stats` feature forwards into.
+dope = "0.4.2"
 o3 = "0.1"
 libc = "0.2"
 webpki-roots = "1.0"
@@ -18,10 +19,15 @@ rustls = { version = "0.23", optional = true }
 
 [features]
 rustls = ["dep:rustls"]
+# Forwards the TLS staging boxes into dope's per-thread HWM counters. Default OFF.
+mem-stats = ["dope/mem-stats"]
 
 [dev-dependencies]
 ring = "0.17"
 rcgen = "0.14"
+dope-extra = "0.4"
+dope-gen = "0.4"
+pin-project = "1"
 
 [lints.rust]
 rust_2024_compatibility = { level = "warn", priority = -1 }

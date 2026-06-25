@@ -58,21 +58,29 @@ fn large_app_write_fragments_without_panic() {
         *b = (i % 251) as u8;
     }
 
-    client.write_app(&payload).unwrap();
-    let ciphertext = client.pull_send();
-    assert!(!ciphertext.is_empty());
-
+    let mut sent_plain = 0;
     let mut received = Vec::new();
-    for chunk in ciphertext.chunks(8192) {
-        server.read_tcp(chunk).expect("server.read_tcp");
-        while let Some(app) = server.pull_app() {
-            received.extend_from_slice(&app);
+    while sent_plain < payload.len() {
+        let n = client.write_app(&payload[sent_plain..]).unwrap();
+        sent_plain += n;
+        let ciphertext = client.pull_send();
+        for chunk in ciphertext.chunks(8192) {
+            server.read_tcp(chunk).expect("server.read_tcp");
+            while let Some(app) = server.pull_app() {
+                received.extend_from_slice(&app);
+            }
         }
+        // Progress, or ciphertext we just drained to free room for the next pass.
+        assert!(
+            n > 0 || !ciphertext.is_empty(),
+            "no progress and nothing to drain: SEND_CAP too small for one record"
+        );
     }
     while let Some(app) = server.pull_app() {
         received.extend_from_slice(&app);
     }
 
+    assert_eq!(sent_plain, payload.len());
     assert_eq!(received, payload);
 }
 

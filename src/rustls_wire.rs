@@ -3,16 +3,16 @@ use std::slice;
 use std::sync::Arc;
 
 use dope::Driver;
-use dope::o3::buffer::Rolling;
 use dope::runtime::token::Token;
 use dope::transport::link::Core;
 use dope::wire::{Reclaim, RecvChunk, Vectored, Wire};
-
+use o3::buffer::Rolling;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+use shin::record::MAX_PLAINTEXT_BODY;
 
-const TLS_PLAIN_CAP: usize = 16 * 1024;
-const TLS_WIRE_CAP: usize = 32 * 1024;
+use crate::staging::{MAX_TLS_RECORD, TLS_STAGING_CAP, boxed_rolling};
+
 const PENDING_APP_CAP: usize = 1 << 20;
 /// Hard cap on the egress overflow `tail`. Ciphertext production is gated on
 /// available egress room (see `egress_has_record_room`), so the tail should only
@@ -22,21 +22,14 @@ const TAIL_CAP: usize = 1 << 20;
 /// Hard cap on buffered inbound ciphertext that rustls could not accept yet
 /// because its received-plaintext buffer was full (backpressure, not an error).
 const PENDING_RECV_CAP: usize = 1 << 20;
-/// Largest plaintext body a single TLS record can carry. Used to chunk
-/// application writes so each feed produces at most one record of ciphertext,
-/// keeping the egress/tail bound tight.
-const MAX_TLS_PLAINTEXT: usize = 16 * 1024;
-/// Worst-case ciphertext size for one record (plaintext body + TLS overhead).
-/// Egress must have at least this much spare room before we feed a fresh chunk.
-const MAX_TLS_RECORD: usize = MAX_TLS_PLAINTEXT + 512;
 
 /// rustls-backed connection endpoint configuration carried in `InitConfig`.
 ///
 /// Mirrors the shin `Endpoint` enum: it selects which kind of TLS connection a
-/// freshly-`new`'d [`RustlsTls`] should construct.
+/// freshly-`new`'d [`RustTls`] should construct.
 #[derive(Clone, Default)]
-pub enum RustlsEndpoint {
-    /// No TLS configured. Constructing a [`RustlsTls`] from this immediately
+pub enum RustTlsEndpoint {
+    /// No TLS configured. Constructing a [`RustTls`] from this immediately
     /// flags the connection for close.
     #[default]
     None,
@@ -145,12 +138,13 @@ impl ConnState {
 /// is staged in `egress` (a fixed [`Rolling`] buffer) plus an overflow `tail`,
 /// and the single in-flight send is owned and re-driven by this type, which is
 /// why [`Wire::RECLAIM`] is [`Reclaim::OnSubmit`].
-pub struct RustlsTls {
+pub struct RustTls {
     state: ConnState,
     /// Decrypted application plaintext, surfaced via `process_recv` for the
-    /// `RustlsEndpoint::None` path (kept for symmetry with the shin wire).
+    /// `RustTlsEndpoint::None` path (kept for symmetry with the shin wire).
     ingress: Vec<u8>,
-    egress: Rolling<TLS_WIRE_CAP>,
+    /// Boxed so the inline wire (in every pool slab slot) stays small.
+    egress: Box<Rolling<TLS_STAGING_CAP>>,
     /// Ciphertext that did not fit into `egress` on the last drain. Flushed back
     /// into `egress` (front of the queue) before pulling new ciphertext.
     tail: Vec<u8>,
@@ -158,7 +152,7 @@ pub struct RustlsTls {
     send_inflight: bool,
 }
 
-impl RustlsTls {
+impl RustTls {
     fn is_established(&self) -> bool {
         self.state
             .conn
@@ -369,7 +363,7 @@ impl RustlsTls {
         }
         let mut consumed = 0;
         while consumed < plain.len() && self.egress_has_record_room() {
-            let end = (consumed + MAX_TLS_PLAINTEXT).min(plain.len());
+            let end = (consumed + MAX_PLAINTEXT_BODY).min(plain.len());
             let n = match self.state.conn.as_mut() {
                 Some(conn) => match conn.writer_write(&plain[consumed..end]) {
                     Ok(n) => n,
@@ -408,7 +402,7 @@ impl RustlsTls {
         // tail stays bounded. Whatever does not fit stays in `pending_app`.
         let mut off = 0;
         while off < self.state.pending_app.len() && self.egress_has_record_room() {
-            let end = (off + MAX_TLS_PLAINTEXT).min(self.state.pending_app.len());
+            let end = (off + MAX_PLAINTEXT_BODY).min(self.state.pending_app.len());
             let n = match self.state.conn.as_mut() {
                 Some(conn) => match conn.writer_write(&self.state.pending_app[off..end]) {
                     Ok(n) => n,
@@ -500,29 +494,39 @@ impl RustlsTls {
     }
 }
 
-impl Wire for RustlsTls {
-    type InitConfig = RustlsEndpoint;
+impl Drop for RustTls {
+    fn drop(&mut self) {
+        crate::memstats::egress_release();
+    }
+}
+
+impl Wire for RustTls {
+    type InitConfig = RustTlsEndpoint;
 
     const RECLAIM: Reclaim = Reclaim::OnSubmit;
 
-    fn new(cfg: &RustlsEndpoint) -> Self {
+    fn new(cfg: &RustTlsEndpoint) -> Self {
         let mut s = ConnState::empty();
         let conn = match cfg {
-            RustlsEndpoint::Server(c) => ServerConnection::new(c.clone()).ok().map(Conn::Server),
-            RustlsEndpoint::Client {
+            RustTlsEndpoint::Server(c) => ServerConnection::new(c.clone()).ok().map(Conn::Server),
+            RustTlsEndpoint::Client {
                 config,
                 server_name,
             } => ClientConnection::new(config.clone(), server_name.clone())
                 .ok()
                 .map(Conn::Client),
-            RustlsEndpoint::None => None,
+            RustTlsEndpoint::None => None,
         };
         s.close = conn.is_none();
         s.conn = conn;
+        // egress box allocated below; rustls owns its own recv/send buffers, so
+        // this backend reports only egress.
+        crate::memstats::egress_borrow();
         let mut me = Self {
             state: s,
-            ingress: Vec::with_capacity(TLS_PLAIN_CAP),
-            egress: Rolling::default(),
+            // Lazy: only the no-TLS passthrough path fills `ingress`.
+            ingress: Vec::new(),
+            egress: boxed_rolling(),
             tail: Vec::new(),
             send_inflight: false,
         };

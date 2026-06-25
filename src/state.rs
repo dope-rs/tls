@@ -5,8 +5,12 @@ use shin::record::{
 };
 use shin::{Epoch, Event, KeyDirection};
 
-const RECV_CAP: usize = 32 * 1024;
-const SEND_CAP: usize = 64 * 1024;
+use crate::staging::{TLS_STAGING_CAP, boxed_rolling};
+
+// One record at a time; multi-record handshake flights reassemble in the
+// separate `hs_reassembly`, so these only ever need room for one record.
+const RECV_CAP: usize = TLS_STAGING_CAP;
+const SEND_CAP: usize = TLS_STAGING_CAP;
 
 const INCOMING_APP_CAP: usize = 1 << 20;
 const HS_REASSEMBLY_CAP: usize = 1 << 18;
@@ -133,6 +137,8 @@ impl State {
     }
 
     fn empty(side: Side) -> Self {
+        crate::memstats::recv_borrow();
+        crate::memstats::send_borrow();
         Self {
             side,
             phase: Phase::Handshaking,
@@ -140,8 +146,8 @@ impl State {
             handshake_opener: None,
             app_sealer: None,
             app_opener: None,
-            recv_buf: Box::new(Rolling::default()),
-            pending_send: Box::new(Rolling::default()),
+            recv_buf: boxed_rolling(),
+            pending_send: boxed_rolling(),
             incoming_app: Vec::new(),
             hs_reassembly: Vec::new(),
             handshake_keys_ready: false,
@@ -448,6 +454,29 @@ impl State {
     }
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        crate::memstats::recv_release();
+        crate::memstats::send_release();
+    }
+}
+
+#[cfg(test)]
+mod buffer_sizing_tests {
+    use super::{RECV_CAP, SEND_CAP};
+    use crate::staging::MAX_TLS_RECORD;
+
+    #[test]
+    fn recv_send_caps_are_right_sized() {
+        const {
+            assert!(RECV_CAP >= MAX_TLS_RECORD, "recv must fit one full record");
+            assert!(SEND_CAP >= MAX_TLS_RECORD, "send must fit one full record");
+            assert!(SEND_CAP <= 32 * 1024, "send must not be a bulk buffer");
+            assert!(RECV_CAP <= 32 * 1024, "recv must not be a bulk buffer");
+        }
+    }
+}
+
 #[cfg(test)]
 mod handshake_reassembly_tests {
     use super::State;
@@ -502,9 +531,10 @@ mod handshake_reassembly_tests {
 
 #[cfg(test)]
 mod send_overflow_tests {
-    use super::{ContentType, Error, SEND_CAP, State};
     use ring::rand::{SecureRandom, SystemRandom};
     use shin::sig::SigningKey;
+
+    use super::{ContentType, Error, SEND_CAP, State};
 
     fn signing_key() -> SigningKey {
         let mut seed = [0u8; 32];
@@ -564,7 +594,9 @@ mod send_overflow_tests {
 
         // Fill pending_send so that only a handful of bytes remain free, far
         // less than a sealed application record needs.
-        client.pending_send.consume(client.pending_send.as_slice().len());
+        client
+            .pending_send
+            .consume(client.pending_send.as_slice().len());
         let chunk = [0u8; 4096];
         while client.pending_send.spare_capacity() > 8 {
             let take = chunk.len().min(client.pending_send.spare_capacity());

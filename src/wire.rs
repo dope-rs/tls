@@ -1,16 +1,15 @@
 use std::slice;
 
 use dope::Driver;
-use dope::o3::buffer::Rolling;
 use dope::runtime::token::Token;
 use dope::transport::link::Core;
 use dope::wire::{Reclaim, RecvChunk, Vectored, Wire};
-use shin::record::{HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY};
+use o3::buffer::Rolling;
+use shin::record::MAX_PLAINTEXT_BODY;
 
+use crate::staging::{MAX_TLS_RECORD, TLS_STAGING_CAP, boxed_rolling};
 use crate::state::State;
 
-const TLS_PLAIN_CAP: usize = 16 * 1024;
-const TLS_WIRE_CAP: usize = 32 * 1024;
 const PENDING_APP_CAP: usize = 1 << 20;
 const INGRESS_CAP: usize = 1 << 20;
 
@@ -41,7 +40,8 @@ pub enum Endpoint {
 pub struct Tls {
     state: ConnState,
     ingress: Vec<u8>,
-    egress: Rolling<TLS_WIRE_CAP>,
+    // Boxed so the inline wire (in every pool slab slot) stays small.
+    egress: Box<Rolling<TLS_STAGING_CAP>>,
     // True while a send referencing egress is in flight; egress must not move.
     send_inflight: bool,
 }
@@ -111,7 +111,7 @@ impl Tls {
     }
 
     fn egress_has_record_room(&self) -> bool {
-        self.egress.spare_capacity() >= HEADER_LEN + MAX_CIPHERTEXT_BODY
+        self.egress.spare_capacity() >= MAX_TLS_RECORD
     }
 
     fn seal_record(&mut self, chunk: &[u8]) -> usize {
@@ -178,6 +178,12 @@ impl Tls {
     }
 }
 
+impl Drop for Tls {
+    fn drop(&mut self) {
+        crate::memstats::egress_release();
+    }
+}
+
 impl Wire for Tls {
     type InitConfig = Endpoint;
 
@@ -192,10 +198,14 @@ impl Wire for Tls {
         };
         s.close = tls.is_none();
         s.tls = tls;
+        // egress box, allocated below for every wire (recv/send are counted per
+        // `State` in `State::empty`).
+        crate::memstats::egress_borrow();
         Self {
             state: s,
-            ingress: Vec::with_capacity(TLS_PLAIN_CAP),
-            egress: Rolling::default(),
+            // Lazy: only the no-TLS passthrough path fills `ingress`.
+            ingress: Vec::new(),
+            egress: boxed_rolling(),
             send_inflight: false,
         }
     }
@@ -276,5 +286,62 @@ impl Wire for Tls {
         self.encrypt(&[]);
         self.submit_wire_buf(core, ud, driver);
         self.propagate_close(core);
+    }
+}
+
+#[cfg(test)]
+mod buffer_sizing_tests {
+    use ring::rand::{SecureRandom, SystemRandom};
+    use shin::sig::SigningKey;
+
+    use super::*;
+
+    fn server_endpoint() -> Endpoint {
+        let mut seed = [0u8; 32];
+        SystemRandom::new().fill(&mut seed).unwrap();
+        let signing = SigningKey::from_seed(&seed).unwrap();
+        Endpoint::Server(Box::new(shin::server::Config {
+            source: shin::server::CertSource::RawPublicKey {
+                signing_key: signing,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            ticket_secret: None,
+            accept_early_data: false,
+        }))
+    }
+
+    #[test]
+    fn egress_is_right_sized_to_one_record() {
+        const {
+            assert!(
+                TLS_STAGING_CAP >= MAX_TLS_RECORD,
+                "egress must fit one full TLS record"
+            );
+            assert!(
+                TLS_STAGING_CAP <= 32 * 1024,
+                "egress must not be a 32/64 KiB bulk buffer"
+            );
+        }
+    }
+
+    #[test]
+    fn ingress_is_lazy_not_preallocated() {
+        let tls = Tls::new(&server_endpoint());
+        assert_eq!(
+            tls.ingress.capacity(),
+            0,
+            "ingress must be lazily allocated, not pre-sized"
+        );
+    }
+
+    #[test]
+    fn inline_tls_does_not_embed_staging_array() {
+        const {
+            assert!(
+                core::mem::size_of::<Tls>() < MAX_TLS_RECORD,
+                "inline Tls must not embed a record-sized staging array"
+            );
+        }
     }
 }

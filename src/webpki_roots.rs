@@ -83,8 +83,10 @@ mod der_len_tests {
         let len = 0x0123_4567usize;
         Der::write_len(&mut out, len);
         assert_eq!(out, [0x84, 0x01, 0x23, 0x45, 0x67]);
-        let decoded =
-            ((out[1] as usize) << 24) | ((out[2] as usize) << 16) | ((out[3] as usize) << 8) | out[4] as usize;
+        let decoded = ((out[1] as usize) << 24)
+            | ((out[2] as usize) << 16)
+            | ((out[3] as usize) << 8)
+            | out[4] as usize;
         assert_eq!(decoded, len);
     }
 }
