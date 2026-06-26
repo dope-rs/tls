@@ -1,6 +1,6 @@
 [package]
 name = "dope-tls"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 description = "TCP TLS streams for dope runtime, shin-backed"
 license = "MIT"
@@ -9,8 +9,8 @@ readme = "README.md"
 
 [dependencies]
 shin = "0.3"
-dope = "0.4.2"
-o3 = "0.1"
+dope = "0.5"
+o3 = "0.2"
 libc = "0.2"
 webpki-roots = "1.0"
 rustls-pki-types = "1"
@@ -23,8 +23,8 @@ mem-stats = ["dope/mem-stats"]
 [dev-dependencies]
 ring = "0.17"
 rcgen = "0.14"
-dope-extra = "0.4"
-dope-gen = "0.4"
+dope-extra = "0.5"
+dope-gen = "0.5"
 pin-project = "1"
 
 [lints.rust]

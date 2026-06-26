@@ -5,7 +5,7 @@ use std::cell::RefCell;
 
 use o3::buffer::Rolling;
 
-use crate::staging::{TLS_STAGING_CAP, boxed_rolling};
+use crate::staging::TLS_STAGING_CAP;
 
 type Buf = Box<Rolling<TLS_STAGING_CAP>>;
 
@@ -14,7 +14,8 @@ thread_local! {
 }
 
 fn acquire() -> Buf {
-    FREE.with_borrow_mut(Vec::pop).unwrap_or_else(boxed_rolling)
+    FREE.with_borrow_mut(Vec::pop)
+        .unwrap_or_else(o3::mem::boxed_zeroed::<Rolling<TLS_STAGING_CAP>>)
 }
 
 fn release(mut buf: Buf) {
