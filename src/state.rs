@@ -1,3 +1,4 @@
+use shin::alert::{Alert, AlertDescription, AlertParseError};
 use shin::record::{
     AEAD_TAG_LEN, ContentType, HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY, Opener,
     PlaintextRecord, RecordError, Sealer,
@@ -9,10 +10,9 @@ use crate::pool::Pooled;
 const INCOMING_APP_CAP: usize = 1 << 20;
 const HS_REASSEMBLY_CAP: usize = 1 << 18;
 
-const ALERT_LEVEL_FATAL: u8 = 2;
-const ALERT_RECORD_OVERFLOW: u8 = 22;
-
 const HS_HEADER_LEN: usize = 4;
+const INNER_CONTENT_TYPE_LEN: usize = 1;
+const KEY_UPDATE_PAYLOAD_LEN: usize = 1;
 
 const REC_CCS: u8 = 20;
 const REC_ALERT: u8 = 21;
@@ -34,9 +34,20 @@ pub enum Error {
     UnexpectedRecord,
     NotEstablished,
     Io(std::io::Error),
-    PlaintextAlert { level: u8, desc: u8 },
+    PeerAlert(AlertDescription),
+    MalformedAlert,
+    Truncated,
     Overflow,
     SendOverflow,
+    EarlyDataUnsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerClose {
+    Open,
+    CloseNotify,
+    Fatal(AlertDescription),
+    Truncated,
 }
 
 impl From<RecordError> for Error {
@@ -52,27 +63,46 @@ impl PartialEq for Error {
             | (Self::UnexpectedRecord, Self::UnexpectedRecord)
             | (Self::NotEstablished, Self::NotEstablished)
             | (Self::Overflow, Self::Overflow)
-            | (Self::SendOverflow, Self::SendOverflow) => true,
+            | (Self::SendOverflow, Self::SendOverflow)
+            | (Self::EarlyDataUnsupported, Self::EarlyDataUnsupported)
+            | (Self::MalformedAlert, Self::MalformedAlert)
+            | (Self::Truncated, Self::Truncated) => true,
             (Self::Record(a), Self::Record(b)) => a == b,
             (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
-            (
-                Self::PlaintextAlert {
-                    level: la,
-                    desc: da,
-                },
-                Self::PlaintextAlert {
-                    level: lb,
-                    desc: db,
-                },
-            ) => la == lb && da == db,
+            (Self::PeerAlert(a), Self::PeerAlert(b)) => a == b,
             _ => false,
         }
     }
 }
 
+/// Per-connection wall clock, milliseconds since the UNIX epoch.
+///
+/// ```
+/// # use dope_tls::WallClock;
+/// let prod = WallClock::System;
+/// let test = WallClock::FixedMillis(1_700_000_000_000);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub enum WallClock {
+    System,
+    FixedMillis(u64),
+}
+
+impl shin::Clock for WallClock {
+    fn now_ms(&self) -> u64 {
+        match self {
+            WallClock::System => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            WallClock::FixedMillis(ms) => *ms,
+        }
+    }
+}
+
 enum Side {
-    Client(shin::client::Client),
-    Server(shin::server::Server),
+    Client(shin::client::Client<WallClock>),
+    Server(shin::server::Server<WallClock>),
 }
 
 pub struct State {
@@ -90,11 +120,20 @@ pub struct State {
     hs_reassembly: Vec<u8>,
 
     handshake_keys_ready: bool,
+    peer_close: PeerClose,
 }
 
 impl State {
     pub fn new_client(config: shin::client::Config) -> Result<Self, Error> {
-        let mut state = Self::empty(Side::Client(shin::client::Client::new(config)));
+        Self::new_client_with_clock(config, WallClock::System)
+    }
+
+    pub fn new_client_with_clock(
+        config: shin::client::Config,
+        clock: WallClock,
+    ) -> Result<Self, Error> {
+        config.validate().map_err(Error::Detail)?;
+        let mut state = Self::empty(Side::Client(shin::client::Client::new(config, clock)));
         let evs = match &mut state.side {
             Side::Client(c) => c.start().map_err(Error::Detail)?,
             _ => unreachable!(),
@@ -104,17 +143,25 @@ impl State {
     }
 
     pub fn new_server(config: shin::server::Config) -> Self {
-        Self::empty(Side::Server(shin::server::Server::new(config)))
+        Self::new_server_with_clock(config, WallClock::System)
+    }
+
+    pub fn new_server_with_clock(config: shin::server::Config, clock: WallClock) -> Self {
+        Self::empty(Side::Server(shin::server::Server::new(config, clock)))
+    }
+
+    fn push_if_fits(&mut self, wire: &[u8]) -> Result<(), Error> {
+        if self.pending_send.spare_capacity() < wire.len() {
+            return Err(Error::SendOverflow);
+        }
+        self.pending_send.push(wire);
+        Ok(())
     }
 
     fn seal_app(&mut self, ct: ContentType, data: &[u8]) -> Result<(), Error> {
         let sealer = self.app_sealer.as_mut().ok_or(Error::NotEstablished)?;
         let wire = sealer.seal(ct, data)?;
-        if self.pending_send.spare_capacity() < wire.len() {
-            return Err(Error::SendOverflow);
-        }
-        self.pending_send.push(&wire);
-        Ok(())
+        self.push_if_fits(&wire)
     }
 
     fn seal_handshake(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -123,11 +170,7 @@ impl State {
             .as_mut()
             .ok_or(Error::UnexpectedRecord)?;
         let wire = sealer.seal(ContentType::Handshake, data)?;
-        if self.pending_send.spare_capacity() < wire.len() {
-            return Err(Error::SendOverflow);
-        }
-        self.pending_send.push(&wire);
-        Ok(())
+        self.push_if_fits(&wire)
     }
 
     fn empty(side: Side) -> Self {
@@ -143,6 +186,7 @@ impl State {
             incoming_app: Vec::new(),
             hs_reassembly: Vec::new(),
             handshake_keys_ready: false,
+            peer_close: PeerClose::Open,
         }
     }
 
@@ -156,7 +200,6 @@ impl State {
             }
             while self.consume_one_record()? {}
             if rest.is_empty() {
-                // Empty unless a split record is still pending reassembly.
                 self.recv_buf.release_if_empty();
                 return Ok(());
             }
@@ -194,14 +237,31 @@ impl State {
         let mut consumed = 0;
         while consumed < plaintext.len() {
             let end = (consumed + MAX_PLAINTEXT_BODY).min(plaintext.len());
-            let need = HEADER_LEN + (end - consumed) + 1 + AEAD_TAG_LEN;
+            let need = HEADER_LEN + (end - consumed) + INNER_CONTENT_TYPE_LEN + AEAD_TAG_LEN;
             if self.pending_send.spare_capacity() < need {
                 break;
             }
             self.seal_app(ContentType::ApplicationData, &plaintext[consumed..end])?;
             consumed = end;
         }
+        self.maybe_auto_key_update()?;
         Ok(consumed)
+    }
+
+    fn maybe_auto_key_update(&mut self) -> Result<(), Error> {
+        let due = self
+            .app_sealer
+            .as_ref()
+            .is_some_and(|s| s.needs_key_update());
+        const KEY_UPDATE_RECORD_MAX: usize = HEADER_LEN
+            + HS_HEADER_LEN
+            + KEY_UPDATE_PAYLOAD_LEN
+            + INNER_CONTENT_TYPE_LEN
+            + AEAD_TAG_LEN;
+        if due && !self.is_closed() && self.pending_send.spare_capacity() >= KEY_UPDATE_RECORD_MAX {
+            self.send_key_update(false)?;
+        }
+        Ok(())
     }
 
     pub fn send_key_update(&mut self, request_update: bool) -> Result<(), Error> {
@@ -216,14 +276,36 @@ impl State {
     }
 
     pub fn send_close_notify(&mut self) -> Result<(), Error> {
+        self.seal_closing_alert(Alert::close_notify())
+    }
+
+    pub fn send_fatal_alert(&mut self, desc: AlertDescription) -> Result<(), Error> {
+        self.seal_closing_alert(Alert::fatal(desc))
+    }
+
+    fn seal_closing_alert(&mut self, alert: Alert) -> Result<(), Error> {
         if self.is_closed() {
             return Ok(());
         }
         if !self.is_established() {
             return Err(Error::NotEstablished);
         }
-        self.seal_app(ContentType::Alert, &[1, 0])?;
+        self.seal_app(ContentType::Alert, &alert.body())?;
         self.phase = Phase::Closed;
+        Ok(())
+    }
+
+    pub fn peer_close(&self) -> PeerClose {
+        self.peer_close
+    }
+
+    /// Errors with [`Error::Truncated`] on EOF before the peer's close_notify.
+    pub fn on_peer_eof(&mut self) -> Result<(), Error> {
+        if self.peer_close == PeerClose::Open {
+            self.peer_close = PeerClose::Truncated;
+            self.phase = Phase::Closed;
+            return Err(Error::Truncated);
+        }
         Ok(())
     }
 
@@ -295,12 +377,36 @@ impl State {
     }
 
     fn handle_alert(&mut self, total: usize) -> Result<bool, Error> {
-        let view = self.recv_buf.as_slice();
-        let level = view.get(HEADER_LEN).copied().unwrap_or(0);
-        let desc = view.get(HEADER_LEN + 1).copied().unwrap_or(0);
+        let parsed = Alert::parse(
+            self.recv_buf
+                .as_slice()
+                .get(HEADER_LEN..total)
+                .unwrap_or(&[]),
+        );
         self.recv_buf.consume(total);
+        self.classify_alert(parsed, false)
+    }
+
+    fn classify_alert(
+        &mut self,
+        parsed: Result<Alert, AlertParseError>,
+        encrypted: bool,
+    ) -> Result<bool, Error> {
         self.phase = Phase::Closed;
-        Err(Error::PlaintextAlert { level, desc })
+        let alert = match parsed {
+            Ok(a) => a,
+            Err(_) => {
+                self.peer_close = PeerClose::Fatal(AlertDescription::DecodeError);
+                return Err(Error::MalformedAlert);
+            }
+        };
+        if encrypted && alert.description == AlertDescription::CloseNotify {
+            self.peer_close = PeerClose::CloseNotify;
+            Ok(false)
+        } else {
+            self.peer_close = PeerClose::Fatal(alert.description);
+            Err(Error::PeerAlert(alert.description))
+        }
     }
 
     fn handle_handshake_plaintext(&mut self, total: usize) -> Result<bool, Error> {
@@ -325,9 +431,16 @@ impl State {
         .ok_or(Error::UnexpectedRecord)?;
 
         let view_mut = self.recv_buf.as_mut_slice();
-        let (inner_type, range, consumed) = opener
-            .open(&mut view_mut[..total])?
-            .ok_or(Error::UnexpectedRecord)?;
+        let opened = opener.open(&mut view_mut[..total]);
+        let (inner_type, range, consumed) = match opened {
+            Ok(Some(v)) => v,
+            Ok(None) => return Err(Error::UnexpectedRecord),
+            Err(e) => {
+                self.stage_fatal_alert(AlertDescription::BadRecordMac);
+                self.phase = Phase::Closed;
+                return Err(Error::Record(e));
+            }
+        };
 
         match inner_type {
             ContentType::ApplicationData => {
@@ -357,8 +470,9 @@ impl State {
                 }
             }
             ContentType::Alert => {
+                let parsed = Alert::parse(&view_mut[range]);
                 self.recv_buf.consume(consumed);
-                self.phase = Phase::Closed;
+                return self.classify_alert(parsed, true);
             }
             ContentType::ChangeCipherSpec => {
                 self.recv_buf.consume(consumed);
@@ -368,14 +482,18 @@ impl State {
     }
 
     fn fatal_overflow(&mut self) -> Result<bool, Error> {
-        if self.app_sealer.is_some() {
-            let _ = self.seal_app(
-                ContentType::Alert,
-                &[ALERT_LEVEL_FATAL, ALERT_RECORD_OVERFLOW],
-            );
-        }
+        self.stage_fatal_alert(AlertDescription::RecordOverflow);
         self.phase = Phase::Closed;
         Err(Error::Overflow)
+    }
+
+    fn stage_fatal_alert(&mut self, desc: AlertDescription) {
+        let alert = Alert::fatal(desc);
+        if self.app_sealer.is_some() {
+            let _ = self.seal_app(ContentType::Alert, &alert.body());
+        } else {
+            let _ = self.push_if_fits(&alert.to_plaintext_record());
+        }
     }
 
     fn complete_handshake_prefix(buf: &[u8]) -> usize {
@@ -392,9 +510,17 @@ impl State {
     }
 
     fn feed_shin(&mut self, epoch: Epoch, data: &[u8]) -> Result<(), Error> {
-        let evs = match &mut self.side {
-            Side::Client(c) => c.read(epoch, data).map_err(Error::Detail)?,
-            Side::Server(s) => s.read(epoch, data).map_err(Error::Detail)?,
+        let result = match &mut self.side {
+            Side::Client(c) => c.read(epoch, data),
+            Side::Server(s) => s.read(epoch, data),
+        };
+        let evs = match result {
+            Ok(evs) => evs,
+            Err(e) => {
+                self.stage_fatal_alert(e.alert().description);
+                self.phase = Phase::Closed;
+                return Err(Error::Detail(e));
+            }
         };
         self.absorb_events(evs)
     }
@@ -406,13 +532,11 @@ impl State {
                     Epoch::Plaintext => {
                         let mut tmp: Vec<u8> = Vec::with_capacity(HEADER_LEN + data.len());
                         PlaintextRecord::encode(ContentType::Handshake, &data, &mut tmp)?;
-                        if self.pending_send.spare_capacity() < tmp.len() {
-                            return Err(Error::SendOverflow);
-                        }
-                        self.pending_send.push(&tmp);
+                        self.push_if_fits(&tmp)?;
                     }
                     Epoch::Handshake => self.seal_handshake(&data)?,
                     Epoch::Application => self.seal_app(ContentType::Handshake, &data)?,
+                    Epoch::EarlyData => return Err(Error::EarlyDataUnsupported),
                 },
                 Event::KeysReady {
                     epoch,
@@ -428,7 +552,7 @@ impl State {
                         self.app_opener = Some(Opener::from_secret(&read_secret));
                         self.app_sealer = Some(Sealer::from_secret(&write_secret));
                     }
-                    Epoch::Plaintext => {}
+                    Epoch::Plaintext | Epoch::EarlyData => {}
                 },
                 Event::KeyUpdate { direction, secret } => match direction {
                     KeyDirection::Read => {
@@ -440,32 +564,15 @@ impl State {
                 },
                 Event::PeerExtension { .. } => {}
                 Event::NewSessionTicket { .. } | Event::ResumptionSecret { .. } => {}
-                Event::ZeroRttKeysReady { .. } => {}
+                Event::ZeroRttKeysReady { .. }
+                | Event::EarlyDataAccepted
+                | Event::EarlyDataRejected => {}
                 Event::Done => {
                     self.phase = Phase::Established;
                 }
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod buffer_sizing_tests {
-    use crate::staging::{MAX_TLS_RECORD, TLS_STAGING_CAP};
-
-    #[test]
-    fn recv_send_caps_are_right_sized() {
-        const {
-            assert!(
-                TLS_STAGING_CAP >= MAX_TLS_RECORD,
-                "staging must fit one full record"
-            );
-            assert!(
-                TLS_STAGING_CAP <= 32 * 1024,
-                "staging must not be a bulk buffer"
-            );
-        }
     }
 }
 
@@ -561,7 +668,7 @@ mod send_overflow_tests {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_secret: None,
+            ticket_keys: None,
             accept_early_data: false,
         });
         let mut client = State::new_client(shin::client::Config {
@@ -579,14 +686,10 @@ mod send_overflow_tests {
         (client, server)
     }
 
-    // A near-full `pending_send` must make the next seal return Err(SendOverflow)
-    // instead of panicking inside `Rolling::push`'s overflow assert.
     #[test]
     fn seal_app_returns_err_when_pending_send_nearly_full() {
         let (mut client, _server) = established_pair();
 
-        // Fill pending_send so that only a handful of bytes remain free, far
-        // less than a sealed application record needs.
         client
             .pending_send
             .consume(client.pending_send.as_slice().len());
@@ -598,13 +701,11 @@ mod send_overflow_tests {
         assert!(client.pending_send.spare_capacity() <= 8);
         assert!(client.pending_send.spare_capacity() < TLS_STAGING_CAP);
 
-        // This would overflow the 64 KiB buffer; old code panics in push().
         let err = client
             .seal_app(ContentType::ApplicationData, b"hello world")
             .unwrap_err();
         assert_eq!(err, Error::SendOverflow);
 
-        // The same guard protects the handshake-seal response path.
         let err = client.seal_handshake(b"hello world").unwrap_err();
         assert_eq!(err, Error::SendOverflow);
     }

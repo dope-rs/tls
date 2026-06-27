@@ -10,6 +10,6 @@ pub mod rustls_wire;
 
 #[cfg(feature = "rustls")]
 pub use rustls_wire::{RustTls, RustTlsEndpoint};
-pub use state::{Error, Phase, State};
+pub use state::{Error, PeerClose, Phase, State, WallClock};
 pub use webpki_roots::WebpkiRoots;
 pub use wire::{ConnState, Endpoint, Tls};

@@ -156,9 +156,9 @@ dependencies = [
 
 [[package]]
 name = "dope"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f2af5f0b2507932706f970ded9a6c4de89431a9f855a7d61a0c7e698857781"
+checksum = "bb380bfc9023411491f2097a4cc857d566673e529dd3d24524b3a57067be8bf7"
 dependencies = [
  "io-uring",
  "libc",
@@ -168,9 +168,9 @@ dependencies = [
 
 [[package]]
 name = "dope-extra"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1ce0d8ae99e97adb8a9b4247d382d0726ee84c01547e2151909dd967d2ca411"
+checksum = "dd1c1db26d56c00d4bcb03d0db96c41444d8220639d788cd556f27b84b6abe70"
 dependencies = [
  "dope",
  "libc",
@@ -179,9 +179,9 @@ dependencies = [
 
 [[package]]
 name = "dope-gen"
-version = "0.5.0"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8352e7b40f75f8af0e895b272048761eb16809c91f387d5d3cdac28c0b05a029"
+checksum = "d87195b2966ed217d7fcf11143dbc72fa251fec7a8d5f782f96a29cb1c321a9e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -531,9 +531,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.3.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a10cddc4d4991f721e480d80f9825b5e1113b02750f8eaa612a23b42266ff88"
+checksum = "2084edeb0acc3f08fd295cd3859fa8edf36c7605f63a2012da940a39bc30b4fa"
 dependencies = [
  "ring",
  "subtle",

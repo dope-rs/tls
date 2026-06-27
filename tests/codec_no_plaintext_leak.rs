@@ -1,27 +1,10 @@
-use dope_tls::State;
-use ring::rand::{SecureRandom, SystemRandom};
-use shin::sig::SigningKey;
+mod common;
 
-fn signing_key() -> SigningKey {
-    let mut seed = [0u8; 32];
-    SystemRandom::new().fill(&mut seed).unwrap();
-    SigningKey::from_seed(&seed).unwrap()
-}
+use common::raw_pair;
 
 #[test]
 fn tls_egress_produces_tls_record_not_plaintext() {
-    let signing = signing_key();
-    let server_pubkey = *signing.pubkey().unwrap();
-    let cfg = shin::client::Config {
-        verifier: shin::client::Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
-        },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    };
-    let client = State::new_client(cfg).expect("client init");
+    let (client, _server) = raw_pair();
     let pending = client.pending_send_slice();
     assert!(!pending.is_empty(), "ClientHello must be emitted on init");
     assert_eq!(
@@ -37,29 +20,7 @@ fn tls_egress_produces_tls_record_not_plaintext() {
 
 #[test]
 fn tls_egress_handshake_then_app_record() {
-    let signing = signing_key();
-    let server_pubkey = *signing.pubkey().unwrap();
-    let server_cfg = shin::server::Config {
-        source: shin::server::CertSource::RawPublicKey {
-            signing_key: signing,
-        },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_secret: None,
-        accept_early_data: false,
-    };
-    let client_cfg = shin::client::Config {
-        verifier: shin::client::Verifier::RawPublicKey {
-            expected_pubkey: server_pubkey,
-        },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    };
-
-    let mut client = State::new_client(client_cfg).expect("client init");
-    let mut server = State::new_server(server_cfg);
+    let (mut client, mut server) = raw_pair();
 
     let first = client.pending_send_slice().to_vec();
     let n = first.len();

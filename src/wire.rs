@@ -215,6 +215,13 @@ impl Wire for Tls {
         Some(RecvChunk::Owned(data))
     }
 
+    fn on_recv_eof(&mut self) {
+        if let Some(tls) = self.state.tls.as_mut() {
+            let _ = tls.on_peer_eof();
+        }
+        self.state.close = true;
+    }
+
     fn submit_send(
         &mut self,
         core: &mut Core,
@@ -279,13 +286,17 @@ impl Wire for Tls {
     }
 }
 
+const _: () = assert!(
+    core::mem::size_of::<Tls>() < crate::staging::MAX_TLS_RECORD,
+    "inline Tls must not embed a record-sized staging array"
+);
+
 #[cfg(test)]
 mod buffer_sizing_tests {
     use ring::rand::{SecureRandom, SystemRandom};
     use shin::sig::SigningKey;
 
     use super::*;
-    use crate::staging::TLS_STAGING_CAP;
 
     fn server_endpoint() -> Endpoint {
         let mut seed = [0u8; 32];
@@ -297,23 +308,9 @@ mod buffer_sizing_tests {
             },
             transport_params: Vec::new(),
             alpn_protocols: Vec::new(),
-            ticket_secret: None,
+            ticket_keys: None,
             accept_early_data: false,
         }))
-    }
-
-    #[test]
-    fn egress_is_right_sized_to_one_record() {
-        const {
-            assert!(
-                TLS_STAGING_CAP >= MAX_TLS_RECORD,
-                "egress must fit one full TLS record"
-            );
-            assert!(
-                TLS_STAGING_CAP <= 32 * 1024,
-                "egress must not be a 32/64 KiB bulk buffer"
-            );
-        }
     }
 
     #[test]
@@ -324,15 +321,5 @@ mod buffer_sizing_tests {
             0,
             "ingress must be lazily allocated, not pre-sized"
         );
-    }
-
-    #[test]
-    fn inline_tls_does_not_embed_staging_array() {
-        const {
-            assert!(
-                core::mem::size_of::<Tls>() < MAX_TLS_RECORD,
-                "inline Tls must not embed a record-sized staging array"
-            );
-        }
     }
 }

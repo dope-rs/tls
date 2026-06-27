@@ -1,4 +1,7 @@
-use dope_tls::{State, WebpkiRoots};
+mod common;
+
+use common::pump;
+use dope_tls::{State, WallClock, WebpkiRoots};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use shin::asn1::{Reader, Tag};
 use shin::cert::{Cert, SubjectPublicKeyInfo};
@@ -38,23 +41,6 @@ fn ed25519_self_signed() -> (Vec<u8>, SigningKey) {
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let cert = params.self_signed(&key).unwrap();
     (cert.der().to_vec(), signing)
-}
-
-fn pump(client: &mut State, server: &mut State) {
-    for _ in 0..16 {
-        let from_client = client.pull_send();
-        let from_server = server.pull_send();
-        let progressed = !from_client.is_empty() || !from_server.is_empty();
-        if !from_client.is_empty() {
-            server.read_tcp(&from_client).expect("server.read_tcp");
-        }
-        if !from_server.is_empty() {
-            client.read_tcp(&from_server).expect("client.read_tcp");
-        }
-        if !progressed {
-            break;
-        }
-    }
 }
 
 #[test]
@@ -115,20 +101,22 @@ fn x509_handshake_round_trip() {
         },
         transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
-        ticket_secret: None,
+        ticket_keys: None,
         accept_early_data: false,
     });
-    let mut client = State::new_client(shin::client::Config {
-        verifier: Verifier::X509 {
-            anchors: vec![anchor],
-            hostname: HOSTNAME.as_bytes().to_vec(),
-            now_seconds: now,
+    let mut client = State::new_client_with_clock(
+        shin::client::Config {
+            verifier: Verifier::X509 {
+                anchors: vec![anchor],
+                hostname: HOSTNAME.as_bytes().to_vec(),
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
         },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        resumption: None,
-        enable_early_data: false,
-    })
+        WallClock::FixedMillis(now * 1000),
+    )
     .unwrap();
 
     pump(&mut client, &mut server);
