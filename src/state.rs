@@ -1,7 +1,7 @@
 use shin::alert::{Alert, AlertDescription, AlertParseError};
 use shin::record::{
-    AEAD_TAG_LEN, ContentType, HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY, Opener,
-    PlaintextRecord, RecordError, Sealer,
+    AEAD_TAG_LEN, CipherSuite, ContentType, HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY,
+    Opener, PlaintextRecord, RecordError, Sealer,
 };
 use shin::{Epoch, Event, KeyDirection};
 
@@ -132,8 +132,18 @@ impl State {
         config: shin::client::Config,
         clock: WallClock,
     ) -> Result<Self, Error> {
+        Self::new_client_with(config, clock, |_| {})
+    }
+
+    pub fn new_client_with(
+        config: shin::client::Config,
+        clock: WallClock,
+        configure: impl FnOnce(&mut shin::client::Client<WallClock>),
+    ) -> Result<Self, Error> {
         config.validate().map_err(Error::Detail)?;
-        let mut state = Self::empty(Side::Client(shin::client::Client::new(config, clock)));
+        let mut client = shin::client::Client::new(config, clock);
+        configure(&mut client);
+        let mut state = Self::empty(Side::Client(client));
         let evs = match &mut state.side {
             Side::Client(c) => c.start().map_err(Error::Detail)?,
             _ => unreachable!(),
@@ -344,6 +354,14 @@ impl State {
         }
     }
 
+    fn cipher_suite(&self) -> CipherSuite {
+        let negotiated = match &self.side {
+            Side::Client(c) => c.negotiated_cipher_suite(),
+            Side::Server(s) => s.negotiated_cipher_suite(),
+        };
+        negotiated.unwrap_or(CipherSuite::Aes128GcmSha256)
+    }
+
     fn consume_one_record(&mut self) -> Result<bool, Error> {
         if self.is_closed() {
             return Ok(false);
@@ -542,26 +560,36 @@ impl State {
                     epoch,
                     read_secret,
                     write_secret,
-                } => match epoch {
-                    Epoch::Handshake => {
-                        self.handshake_opener = Some(Opener::from_secret(&read_secret));
-                        self.handshake_sealer = Some(Sealer::from_secret(&write_secret));
-                        self.handshake_keys_ready = true;
+                } => {
+                    let suite = self.cipher_suite();
+                    match epoch {
+                        Epoch::Handshake => {
+                            self.handshake_opener =
+                                Some(Opener::with_suite(read_secret.as_slice(), suite));
+                            self.handshake_sealer =
+                                Some(Sealer::with_suite(write_secret.as_slice(), suite));
+                            self.handshake_keys_ready = true;
+                        }
+                        Epoch::Application => {
+                            self.app_opener =
+                                Some(Opener::with_suite(read_secret.as_slice(), suite));
+                            self.app_sealer =
+                                Some(Sealer::with_suite(write_secret.as_slice(), suite));
+                        }
+                        Epoch::Plaintext | Epoch::EarlyData => {}
                     }
-                    Epoch::Application => {
-                        self.app_opener = Some(Opener::from_secret(&read_secret));
-                        self.app_sealer = Some(Sealer::from_secret(&write_secret));
+                }
+                Event::KeyUpdate { direction, secret } => {
+                    let suite = self.cipher_suite();
+                    match direction {
+                        KeyDirection::Read => {
+                            self.app_opener = Some(Opener::with_suite(secret.as_slice(), suite));
+                        }
+                        KeyDirection::Write => {
+                            self.app_sealer = Some(Sealer::with_suite(secret.as_slice(), suite));
+                        }
                     }
-                    Epoch::Plaintext | Epoch::EarlyData => {}
-                },
-                Event::KeyUpdate { direction, secret } => match direction {
-                    KeyDirection::Read => {
-                        self.app_opener = Some(Opener::from_secret(&secret));
-                    }
-                    KeyDirection::Write => {
-                        self.app_sealer = Some(Sealer::from_secret(&secret));
-                    }
-                },
+                }
                 Event::PeerExtension { .. } => {}
                 Event::NewSessionTicket { .. } | Event::ResumptionSecret { .. } => {}
                 Event::ZeroRttKeysReady { .. }

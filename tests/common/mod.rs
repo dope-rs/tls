@@ -39,6 +39,26 @@ pub(crate) fn raw_pair() -> (State, State) {
     (raw_client(server_pubkey), raw_server(signing))
 }
 
+pub(crate) fn raw_pair_with_suites(suites: &[shin::record::CipherSuite]) -> (State, State) {
+    let signing = signing_key();
+    let server_pubkey = *signing.pubkey().unwrap();
+    let client = State::new_client_with(
+        shin::client::Config {
+            verifier: shin::client::Verifier::RawPublicKey {
+                expected_pubkey: server_pubkey,
+            },
+            transport_params: Vec::new(),
+            alpn_protocols: Vec::new(),
+            resumption: None,
+            enable_early_data: false,
+        },
+        dope_tls::WallClock::System,
+        |c| c.set_cipher_suites(suites),
+    )
+    .unwrap();
+    (client, raw_server(signing))
+}
+
 pub(crate) fn pump(client: &mut State, server: &mut State) {
     for _ in 0..16 {
         let from_client = client.pull_send();
