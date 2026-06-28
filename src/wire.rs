@@ -1,4 +1,5 @@
 use std::slice;
+use std::sync::Arc;
 
 use dope::Driver;
 use dope::runtime::token::Token;
@@ -8,7 +9,7 @@ use shin::record::MAX_PLAINTEXT_BODY;
 
 use crate::pool::Pooled;
 use crate::staging::MAX_TLS_RECORD;
-use crate::state::State;
+use crate::state::{PeerClose, State};
 
 const PENDING_APP_CAP: usize = 1 << 20;
 const INGRESS_CAP: usize = 1 << 20;
@@ -17,6 +18,7 @@ pub struct ConnState {
     pub tls: Option<State>,
     pub pending_app: Vec<u8>,
     pub close: bool,
+    close_notify_sent: bool,
 }
 
 impl ConnState {
@@ -25,6 +27,7 @@ impl ConnState {
             tls: None,
             pending_app: Vec::new(),
             close: false,
+            close_notify_sent: false,
         }
     }
 }
@@ -34,7 +37,40 @@ pub enum Endpoint {
     #[default]
     None,
     Server(Box<shin::server::Config>),
+    ServerMutual {
+        config: Box<shin::server::Config>,
+        auth: shin::server::ClientAuth,
+        verifier: Arc<dyn shin::server::ClientCertVerifier + Send + Sync>,
+    },
     Client(shin::client::Config),
+    ClientMutual {
+        config: Box<shin::client::Config>,
+        cert: shin::client::ClientCertSource,
+    },
+}
+
+impl Endpoint {
+    pub fn server_mutual(
+        config: shin::server::Config,
+        auth: shin::server::ClientAuth,
+        verifier: Arc<dyn shin::server::ClientCertVerifier + Send + Sync>,
+    ) -> Self {
+        Self::ServerMutual {
+            config: Box::new(config),
+            auth,
+            verifier,
+        }
+    }
+
+    pub fn client_mutual(
+        config: shin::client::Config,
+        cert: shin::client::ClientCertSource,
+    ) -> Self {
+        Self::ClientMutual {
+            config: Box::new(config),
+            cert,
+        }
+    }
 }
 
 pub struct Tls {
@@ -60,7 +96,7 @@ impl Tls {
                     self.state.close = true;
                     return;
                 }
-                if tls.is_closed() {
+                if tls.is_closed() && tls.peer_close() != PeerClose::CloseNotify {
                     self.state.close = true;
                 }
             }
@@ -171,8 +207,26 @@ impl Tls {
     }
 
     fn propagate_close(&self, core: &mut Core) {
-        if self.state.close {
+        if self.state.close || self.peer_close() == PeerClose::CloseNotify {
             core.set_close_after();
+        }
+    }
+
+    pub fn peer_close(&self) -> PeerClose {
+        self.state.tls.as_ref().map_or(PeerClose::Open, State::peer_close)
+    }
+
+    fn seal_close_notify(&mut self) {
+        if self.state.close || self.state.close_notify_sent {
+            return;
+        }
+        let sealed = match self.state.tls.as_mut() {
+            Some(tls) if tls.can_close_notify() => tls.send_close_notify().is_ok(),
+            _ => false,
+        };
+        if sealed {
+            self.state.close_notify_sent = true;
+            self.drain_to_egress();
         }
     }
 }
@@ -186,7 +240,19 @@ impl Wire for Tls {
         let mut s = ConnState::empty();
         let tls = match cfg {
             Endpoint::Server(c) => Some(State::new_server((**c).clone())),
+            Endpoint::ServerMutual {
+                config,
+                auth,
+                verifier,
+            } => Some(State::new_server_mutual(
+                (**config).clone(),
+                *auth,
+                verifier.clone(),
+            )),
             Endpoint::Client(c) => State::new_client(c.clone()).ok(),
+            Endpoint::ClientMutual { config, cert } => {
+                State::new_client_mutual((**config).clone(), cert.clone()).ok()
+            }
             Endpoint::None => None,
         };
         s.close = tls.is_none();
@@ -281,6 +347,12 @@ impl Wire for Tls {
 
     fn flush_pending(&mut self, core: &mut Core, ud: Token, driver: &mut Driver) {
         self.encrypt(&[]);
+        self.submit_wire_buf(core, ud, driver);
+        self.propagate_close(core);
+    }
+
+    fn on_graceful_close(&mut self, core: &mut Core, ud: Token, driver: &mut Driver) {
+        self.seal_close_notify();
         self.submit_wire_buf(core, ud, driver);
         self.propagate_close(core);
     }

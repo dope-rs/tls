@@ -52,6 +52,23 @@ fn eof_after_close_notify_is_clean() {
 }
 
 #[test]
+fn peer_close_notify_can_still_be_echoed() {
+    let (mut client, mut server) = established_pair();
+    client.send_close_notify().unwrap();
+    server.read_tcp(&client.pull_send()).unwrap();
+    assert_eq!(server.peer_close(), PeerClose::CloseNotify);
+    assert!(server.is_closed());
+
+    server
+        .send_close_notify()
+        .expect("a peer-initiated close_notify can still be echoed back");
+    assert!(
+        !server.pull_send().is_empty(),
+        "the echoed close_notify must reach the wire before our FIN"
+    );
+}
+
+#[test]
 fn malformed_plaintext_alert_is_fatal() {
     let server_pubkey = *signing_key().pubkey().unwrap();
     let mut client = raw_client(server_pubkey);

@@ -23,6 +23,25 @@ fn server_to_client_key_update_no_request_rotates_only_reader() {
 }
 
 #[test]
+fn many_key_updates_interleaved_with_app_data_do_not_trip_flood_cap() {
+    let (mut client, mut server) = established_pair();
+
+    for i in 0..12u8 {
+        server.send_key_update(false).unwrap();
+        pump(&mut client, &mut server);
+
+        let msg = [b'a' + i];
+        server.write_app(&msg).unwrap();
+        pump(&mut client, &mut server);
+        assert_eq!(client.pull_app().unwrap(), msg.to_vec());
+    }
+
+    client.write_app(b"client-alive").unwrap();
+    pump(&mut client, &mut server);
+    assert_eq!(&server.pull_app().unwrap(), b"client-alive");
+}
+
+#[test]
 fn server_to_client_key_update_with_request_rotates_both_directions() {
     let (mut client, mut server) = established_pair();
 

@@ -4,6 +4,7 @@ use shin::record::{
     Opener, PlaintextRecord, RecordError, Sealer,
 };
 use shin::{Epoch, Event, KeyDirection};
+use std::sync::Arc;
 
 use crate::pool::Pooled;
 
@@ -23,6 +24,7 @@ const REC_AEAD: u8 = 23;
 pub enum Phase {
     Handshaking,
     Established,
+    PeerClosed,
     Closed,
 }
 
@@ -100,9 +102,45 @@ impl shin::Clock for WallClock {
     }
 }
 
+trait ServerSession {
+    fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error>;
+    fn send_key_update(&mut self, request_update: bool) -> Result<Vec<Event>, shin::Error>;
+    fn selected_alpn(&self) -> Option<&[u8]>;
+    fn negotiated_cipher_suite(&self) -> Option<CipherSuite>;
+    fn note_application_data(&mut self);
+}
+
+impl<V: shin::server::ClientCertVerifier> ServerSession
+    for shin::server::Server<WallClock, shin::server::NoGuard, V>
+{
+    fn read(&mut self, epoch: Epoch, data: &[u8]) -> Result<Vec<Event>, shin::Error> {
+        shin::server::Server::read(self, epoch, data)
+    }
+    fn send_key_update(&mut self, request_update: bool) -> Result<Vec<Event>, shin::Error> {
+        shin::server::Server::send_key_update(self, request_update)
+    }
+    fn selected_alpn(&self) -> Option<&[u8]> {
+        shin::server::Server::selected_alpn(self)
+    }
+    fn negotiated_cipher_suite(&self) -> Option<CipherSuite> {
+        shin::server::Server::negotiated_cipher_suite(self)
+    }
+    fn note_application_data(&mut self) {
+        shin::server::Server::note_application_data(self);
+    }
+}
+
+struct ArcClientVerifier(Arc<dyn shin::server::ClientCertVerifier + Send + Sync>);
+
+impl shin::server::ClientCertVerifier for ArcClientVerifier {
+    fn verify(&self, identity: &shin::server::ClientIdentity<'_>) -> bool {
+        self.0.verify(identity)
+    }
+}
+
 enum Side {
-    Client(shin::client::Client<WallClock>),
-    Server(shin::server::Server<WallClock>),
+    Client(Box<shin::client::Client<WallClock>>),
+    Server(Box<dyn ServerSession>),
 }
 
 pub struct State {
@@ -143,7 +181,7 @@ impl State {
         config.validate().map_err(Error::Detail)?;
         let mut client = shin::client::Client::new(config, clock);
         configure(&mut client);
-        let mut state = Self::empty(Side::Client(client));
+        let mut state = Self::empty(Side::Client(Box::new(client)));
         let evs = match &mut state.side {
             Side::Client(c) => c.start().map_err(Error::Detail)?,
             _ => unreachable!(),
@@ -152,12 +190,46 @@ impl State {
         Ok(state)
     }
 
+    pub fn new_client_mutual(
+        config: shin::client::Config,
+        cert: shin::client::ClientCertSource,
+    ) -> Result<Self, Error> {
+        Self::new_client_mutual_with_clock(config, WallClock::System, cert)
+    }
+
+    pub fn new_client_mutual_with_clock(
+        config: shin::client::Config,
+        clock: WallClock,
+        cert: shin::client::ClientCertSource,
+    ) -> Result<Self, Error> {
+        Self::new_client_with(config, clock, move |c| c.set_client_cert(cert))
+    }
+
     pub fn new_server(config: shin::server::Config) -> Self {
         Self::new_server_with_clock(config, WallClock::System)
     }
 
     pub fn new_server_with_clock(config: shin::server::Config, clock: WallClock) -> Self {
-        Self::empty(Side::Server(shin::server::Server::new(config, clock)))
+        Self::empty(Side::Server(Box::new(shin::server::Server::new(config, clock))))
+    }
+
+    pub fn new_server_mutual(
+        config: shin::server::Config,
+        auth: shin::server::ClientAuth,
+        verifier: Arc<dyn shin::server::ClientCertVerifier + Send + Sync>,
+    ) -> Self {
+        Self::new_server_mutual_with_clock(config, WallClock::System, auth, verifier)
+    }
+
+    pub fn new_server_mutual_with_clock(
+        config: shin::server::Config,
+        clock: WallClock,
+        auth: shin::server::ClientAuth,
+        verifier: Arc<dyn shin::server::ClientCertVerifier + Send + Sync>,
+    ) -> Self {
+        let server =
+            shin::server::Server::with_client_auth(config, clock, auth, ArcClientVerifier(verifier));
+        Self::empty(Side::Server(Box::new(server)))
     }
 
     fn push_if_fits(&mut self, wire: &[u8]) -> Result<(), Error> {
@@ -294,15 +366,19 @@ impl State {
     }
 
     fn seal_closing_alert(&mut self, alert: Alert) -> Result<(), Error> {
-        if self.is_closed() {
+        if matches!(self.phase, Phase::Closed) {
             return Ok(());
         }
-        if !self.is_established() {
+        if self.app_sealer.is_none() {
             return Err(Error::NotEstablished);
         }
         self.seal_app(ContentType::Alert, &alert.body())?;
         self.phase = Phase::Closed;
         Ok(())
+    }
+
+    pub fn can_close_notify(&self) -> bool {
+        matches!(self.phase, Phase::Established | Phase::PeerClosed) && self.app_sealer.is_some()
     }
 
     pub fn peer_close(&self) -> PeerClose {
@@ -340,7 +416,7 @@ impl State {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.phase == Phase::Closed
+        matches!(self.phase, Phase::PeerClosed | Phase::Closed)
     }
 
     pub fn phase(&self) -> Phase {
@@ -410,18 +486,24 @@ impl State {
         parsed: Result<Alert, AlertParseError>,
         encrypted: bool,
     ) -> Result<bool, Error> {
-        self.phase = Phase::Closed;
         let alert = match parsed {
             Ok(a) => a,
             Err(_) => {
+                self.phase = Phase::Closed;
                 self.peer_close = PeerClose::Fatal(AlertDescription::DecodeError);
                 return Err(Error::MalformedAlert);
             }
         };
         if encrypted && alert.description == AlertDescription::CloseNotify {
             self.peer_close = PeerClose::CloseNotify;
+            self.phase = if self.app_sealer.is_some() {
+                Phase::PeerClosed
+            } else {
+                Phase::Closed
+            };
             Ok(false)
         } else {
+            self.phase = Phase::Closed;
             self.peer_close = PeerClose::Fatal(alert.description);
             Err(Error::PeerAlert(alert.description))
         }
@@ -454,7 +536,11 @@ impl State {
             Ok(Some(v)) => v,
             Ok(None) => return Err(Error::UnexpectedRecord),
             Err(e) => {
-                self.stage_fatal_alert(AlertDescription::BadRecordMac);
+                let desc = match e {
+                    RecordError::UnexpectedChangeCipherSpec => AlertDescription::UnexpectedMessage,
+                    _ => AlertDescription::BadRecordMac,
+                };
+                self.stage_fatal_alert(desc);
                 self.phase = Phase::Closed;
                 return Err(Error::Record(e));
             }
@@ -468,6 +554,10 @@ impl State {
                 }
                 self.incoming_app.extend_from_slice(&view_mut[range]);
                 self.recv_buf.consume(consumed);
+                match &mut self.side {
+                    Side::Client(c) => c.note_application_data(),
+                    Side::Server(s) => s.note_application_data(),
+                }
             }
             ContentType::Handshake => {
                 let inner = view_mut[range].to_vec();
