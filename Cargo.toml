@@ -1,6 +1,6 @@
 [package]
 name = "dope-tls"
-version = "0.8.0"
+version = "0.8.2"
 edition = "2024"
 description = "TCP TLS streams for dope runtime, shin-backed"
 license = "MIT"
@@ -8,7 +8,7 @@ repository = "https://github.com/dope-rs/tls"
 readme = "README.md"
 
 [dependencies]
-shin = "0.7"
+shin = "0.7.2"
 dope = "0.5.4"
 o3 = "0.2"
 libc = "0.2"

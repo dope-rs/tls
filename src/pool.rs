@@ -110,6 +110,35 @@ impl Pooled {
         self.ensure().push(src);
     }
 
+    #[must_use]
+    pub(crate) fn try_push(&mut self, src: &[u8]) -> bool {
+        let fits = self.spare_capacity() >= src.len();
+        if fits {
+            self.push(src);
+        }
+        fits
+    }
+
+    /// Stages bytes written by `fill` directly into spare capacity — no
+    /// intermediate copy — then commits the length it reports.
+    ///
+    /// ```ignore
+    /// pooled.try_fill(|spare| sealer.seal_into_slice(ct, data, spare))?;
+    /// ```
+    pub(crate) fn try_fill<E>(
+        &mut self,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<(), E> {
+        let buf = self.ensure();
+        let spare = buf.spare_capacity_mut();
+        let cap = spare.len();
+        let n = fill(spare)?;
+        assert!(n <= cap, "try_fill committed {n} bytes into {cap} of spare");
+        // SAFETY: n <= cap, the length of the slice handed to `fill`.
+        unsafe { buf.advance(n) };
+        Ok(())
+    }
+
     pub(crate) fn consume(&mut self, n: usize) {
         if let Some(b) = self.buf.as_mut() {
             b.consume(n);

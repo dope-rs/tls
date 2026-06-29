@@ -7,9 +7,7 @@ use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, P
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs::cipher_suite;
 use rustls::crypto::{CryptoProvider, verify_tls13_signature};
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
-};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, ServerConfig, ServerConnection,
     SignatureScheme, SupportedCipherSuite,
@@ -207,7 +205,8 @@ fn pump<D>(dope: &mut State, peer: &mut rustls::ConnectionCommon<D>) {
             let mut cursor: &[u8] = &out;
             while !cursor.is_empty() {
                 let n = peer.read_tls(&mut cursor).expect("peer read_tls");
-                peer.process_new_packets().expect("peer process_new_packets");
+                peer.process_new_packets()
+                    .expect("peer process_new_packets");
                 if n == 0 {
                     break;
                 }
@@ -267,8 +266,14 @@ fn client_vs_rustls_server(shin_suite: CipherSuite, rustls_suite: SupportedCiphe
 
     pump(&mut client, &mut server);
 
-    assert!(client.is_established(), "dope-tls client handshake incomplete");
-    assert!(!server.is_handshaking(), "rustls server handshake incomplete");
+    assert!(
+        client.is_established(),
+        "dope-tls client handshake incomplete"
+    );
+    assert!(
+        !server.is_handshaking(),
+        "rustls server handshake incomplete"
+    );
 
     let negotiated = server
         .negotiated_cipher_suite()
@@ -285,7 +290,10 @@ fn client_vs_rustls_server(shin_suite: CipherSuite, rustls_suite: SupportedCiphe
     pump(&mut client, &mut server);
     let mut got = vec![0u8; req.len()];
     use std::io::Read;
-    server.reader().read_exact(&mut got).expect("server read app");
+    server
+        .reader()
+        .read_exact(&mut got)
+        .expect("server read app");
     assert_eq!(got.as_slice(), req, "client->server round-trip");
 
     let reply = b"rustls server -> dope-tls client";
@@ -307,8 +315,14 @@ fn server_vs_rustls_client(rustls_suite: SupportedCipherSuite) -> State {
 
     pump(&mut server, &mut client);
 
-    assert!(server.is_established(), "dope-tls server handshake incomplete");
-    assert!(!client.is_handshaking(), "rustls client handshake incomplete");
+    assert!(
+        server.is_established(),
+        "dope-tls server handshake incomplete"
+    );
+    assert!(
+        !client.is_handshaking(),
+        "rustls client handshake incomplete"
+    );
 
     let negotiated = client
         .negotiated_cipher_suite()
@@ -332,7 +346,10 @@ fn server_vs_rustls_client(rustls_suite: SupportedCipherSuite) -> State {
     pump(&mut server, &mut client);
     let mut echoed = vec![0u8; reply.len()];
     use std::io::Read;
-    client.reader().read_exact(&mut echoed).expect("client read app");
+    client
+        .reader()
+        .read_exact(&mut echoed)
+        .expect("client read app");
     assert_eq!(echoed.as_slice(), reply, "server->client round-trip");
 
     server

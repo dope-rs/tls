@@ -2,9 +2,8 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use dope_tls::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity, State};
-
 use common::{pump, signing_key};
+use dope_tls::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity, State};
 
 const CERT_TYPE_RAW_PUBLIC_KEY: u8 = 2;
 
@@ -102,7 +101,10 @@ fn required_client_auth_completes_and_pins_spki() {
     let seen = verifier.seen.lock().unwrap();
     assert_eq!(seen.calls, 1, "verifier must be invoked exactly once");
     assert_eq!(seen.cert_type, CERT_TYPE_RAW_PUBLIC_KEY);
-    assert_eq!(seen.spki_der, expected_spki, "verifier saw the client's SPKI");
+    assert_eq!(
+        seen.spki_der, expected_spki,
+        "verifier saw the client's SPKI"
+    );
     drop(seen);
 
     round_trip(&mut client, &mut server, b"client to server");

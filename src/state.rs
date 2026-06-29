@@ -1,10 +1,11 @@
+use std::sync::Arc;
+
 use shin::alert::{Alert, AlertDescription, AlertParseError};
 use shin::record::{
     AEAD_TAG_LEN, CipherSuite, ContentType, HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY,
     Opener, PlaintextRecord, RecordError, Sealer,
 };
 use shin::{Epoch, Event, KeyDirection};
-use std::sync::Arc;
 
 use crate::pool::Pooled;
 
@@ -56,6 +57,24 @@ impl From<RecordError> for Error {
     fn from(e: RecordError) -> Self {
         Self::Record(e)
     }
+}
+
+fn seal_overflow(e: RecordError) -> Error {
+    match e {
+        RecordError::BufferTooSmall => Error::SendOverflow,
+        other => Error::Record(other),
+    }
+}
+
+fn seal_into(
+    pending: &mut Pooled,
+    sealer: &mut Sealer,
+    ct: ContentType,
+    data: &[u8],
+) -> Result<(), Error> {
+    pending
+        .try_fill(|spare| sealer.seal_into_slice(ct, data, spare))
+        .map_err(seal_overflow)
 }
 
 impl PartialEq for Error {
@@ -210,7 +229,9 @@ impl State {
     }
 
     pub fn new_server_with_clock(config: shin::server::Config, clock: WallClock) -> Self {
-        Self::empty(Side::Server(Box::new(shin::server::Server::new(config, clock))))
+        Self::empty(Side::Server(Box::new(shin::server::Server::new(
+            config, clock,
+        ))))
     }
 
     pub fn new_server_mutual(
@@ -227,23 +248,26 @@ impl State {
         auth: shin::server::ClientAuth,
         verifier: Arc<dyn shin::server::ClientCertVerifier + Send + Sync>,
     ) -> Self {
-        let server =
-            shin::server::Server::with_client_auth(config, clock, auth, ArcClientVerifier(verifier));
+        let server = shin::server::Server::with_client_auth(
+            config,
+            clock,
+            auth,
+            ArcClientVerifier(verifier),
+        );
         Self::empty(Side::Server(Box::new(server)))
     }
 
     fn push_if_fits(&mut self, wire: &[u8]) -> Result<(), Error> {
-        if self.pending_send.spare_capacity() < wire.len() {
-            return Err(Error::SendOverflow);
+        if self.pending_send.try_push(wire) {
+            Ok(())
+        } else {
+            Err(Error::SendOverflow)
         }
-        self.pending_send.push(wire);
-        Ok(())
     }
 
     fn seal_app(&mut self, ct: ContentType, data: &[u8]) -> Result<(), Error> {
         let sealer = self.app_sealer.as_mut().ok_or(Error::NotEstablished)?;
-        let wire = sealer.seal(ct, data)?;
-        self.push_if_fits(&wire)
+        seal_into(&mut self.pending_send, sealer, ct, data)
     }
 
     fn seal_handshake(&mut self, data: &[u8]) -> Result<(), Error> {
@@ -251,8 +275,7 @@ impl State {
             .handshake_sealer
             .as_mut()
             .ok_or(Error::UnexpectedRecord)?;
-        let wire = sealer.seal(ContentType::Handshake, data)?;
-        self.push_if_fits(&wire)
+        seal_into(&mut self.pending_send, sealer, ContentType::Handshake, data)
     }
 
     fn empty(side: Side) -> Self {

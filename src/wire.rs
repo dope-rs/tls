@@ -213,7 +213,10 @@ impl Tls {
     }
 
     pub fn peer_close(&self) -> PeerClose {
-        self.state.tls.as_ref().map_or(PeerClose::Open, State::peer_close)
+        self.state
+            .tls
+            .as_ref()
+            .map_or(PeerClose::Open, State::peer_close)
     }
 
     fn seal_close_notify(&mut self) {
