@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "dope-tls"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "dope",
  "dope-extra",
@@ -690,9 +690,9 @@ dependencies = [
 
 [[package]]
 name = "shin"
-version = "0.7.2"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f21f982e124bf2e74691033065953bb4e5ce55bf5ef8fab994dea83085f70f16"
+checksum = "8b289f0257618060f758866cd162ff200dbce56cc2e0d7fce421e5d6e7577d97"
 dependencies = [
  "ml-kem",
  "rand_core",

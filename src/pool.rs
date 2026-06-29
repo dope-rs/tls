@@ -110,15 +110,6 @@ impl Pooled {
         self.ensure().push(src);
     }
 
-    #[must_use]
-    pub(crate) fn try_push(&mut self, src: &[u8]) -> bool {
-        let fits = self.spare_capacity() >= src.len();
-        if fits {
-            self.push(src);
-        }
-        fits
-    }
-
     /// Stages bytes written by `fill` directly into spare capacity — no
     /// intermediate copy — then commits the length it reports.
     ///

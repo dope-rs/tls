@@ -31,7 +31,6 @@ pub enum Phase {
 
 #[derive(Debug)]
 pub enum Error {
-    Other,
     Detail(shin::Error),
     Record(RecordError),
     UnexpectedRecord,
@@ -59,7 +58,7 @@ impl From<RecordError> for Error {
     }
 }
 
-fn seal_overflow(e: RecordError) -> Error {
+fn to_send_error(e: RecordError) -> Error {
     match e {
         RecordError::BufferTooSmall => Error::SendOverflow,
         other => Error::Record(other),
@@ -74,14 +73,19 @@ fn seal_into(
 ) -> Result<(), Error> {
     pending
         .try_fill(|spare| sealer.seal_into_slice(ct, data, spare))
-        .map_err(seal_overflow)
+        .map_err(to_send_error)
+}
+
+fn encode_plaintext(pending: &mut Pooled, ct: ContentType, data: &[u8]) -> Result<(), Error> {
+    pending
+        .try_fill(|spare| PlaintextRecord::encode_into_slice(ct, data, spare))
+        .map_err(to_send_error)
 }
 
 impl PartialEq for Error {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Other, Self::Other)
-            | (Self::UnexpectedRecord, Self::UnexpectedRecord)
+            (Self::UnexpectedRecord, Self::UnexpectedRecord)
             | (Self::NotEstablished, Self::NotEstablished)
             | (Self::Overflow, Self::Overflow)
             | (Self::SendOverflow, Self::SendOverflow)
@@ -255,14 +259,6 @@ impl State {
             ArcClientVerifier(verifier),
         );
         Self::empty(Side::Server(Box::new(server)))
-    }
-
-    fn push_if_fits(&mut self, wire: &[u8]) -> Result<(), Error> {
-        if self.pending_send.try_push(wire) {
-            Ok(())
-        } else {
-            Err(Error::SendOverflow)
-        }
     }
 
     fn seal_app(&mut self, ct: ContentType, data: &[u8]) -> Result<(), Error> {
@@ -623,7 +619,7 @@ impl State {
         if self.app_sealer.is_some() {
             let _ = self.seal_app(ContentType::Alert, &alert.body());
         } else {
-            let _ = self.push_if_fits(&alert.to_plaintext_record());
+            let _ = encode_plaintext(&mut self.pending_send, ContentType::Alert, &alert.body());
         }
     }
 
@@ -661,9 +657,7 @@ impl State {
             match e {
                 Event::Send { epoch, data } => match epoch {
                     Epoch::Plaintext => {
-                        let mut tmp: Vec<u8> = Vec::with_capacity(HEADER_LEN + data.len());
-                        PlaintextRecord::encode(ContentType::Handshake, &data, &mut tmp)?;
-                        self.push_if_fits(&tmp)?;
+                        encode_plaintext(&mut self.pending_send, ContentType::Handshake, &data)?
                     }
                     Epoch::Handshake => self.seal_handshake(&data)?,
                     Epoch::Application => self.seal_app(ContentType::Handshake, &data)?,
