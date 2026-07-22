@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use dope_tls::{State, WallClock};
+use dope_tls::{clock::WallClock, state::State};
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs::cipher_suite;
@@ -38,13 +38,13 @@ struct Pki {
 
 fn extract_ed25519_seed(pkcs8: &[u8]) -> [u8; 32] {
     let mut r = Reader::new(pkcs8);
-    let inner = r.expect(Tag::SEQUENCE).unwrap();
+    let inner = r.read_tagged(Tag::SEQUENCE).unwrap();
     let mut ir = Reader::new(inner);
-    let _version = ir.expect(Tag::INTEGER).unwrap();
-    let _alg = ir.expect(Tag::SEQUENCE).unwrap();
-    let outer_oct = ir.expect(Tag::OCTET_STRING).unwrap();
+    let _version = ir.read_tagged(Tag::INTEGER).unwrap();
+    let _alg = ir.read_tagged(Tag::SEQUENCE).unwrap();
+    let outer_oct = ir.read_tagged(Tag::OCTET_STRING).unwrap();
     let mut or = Reader::new(outer_oct);
-    let inner_oct = or.expect(Tag::OCTET_STRING).unwrap();
+    let inner_oct = or.read_tagged(Tag::OCTET_STRING).unwrap();
     assert_eq!(inner_oct.len(), 32, "ed25519 seed length");
     let mut seed = [0u8; 32];
     seed.copy_from_slice(inner_oct);
@@ -194,6 +194,7 @@ fn dope_server(pki: &Pki) -> State {
         ticket_keys: None,
         accept_early_data: false,
     })
+    .expect("valid server buffer layout")
 }
 
 fn pump<D>(dope: &mut State, peer: &mut rustls::ConnectionCommon<D>) {
@@ -234,7 +235,7 @@ fn drain_app(dope: &mut State, want: usize) -> Vec<u8> {
     let mut got = Vec::new();
     while got.len() < want {
         match dope.pull_app() {
-            Some(chunk) if !chunk.is_empty() => got.extend_from_slice(&chunk),
+            Some(chunk) if !chunk.is_empty() => got.extend_from_slice(chunk.as_slice()),
             _ => break,
         }
     }

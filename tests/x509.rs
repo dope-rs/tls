@@ -1,7 +1,7 @@
 mod common;
 
 use common::pump;
-use dope_tls::{State, WallClock, WebpkiRoots};
+use dope_tls::{clock::WallClock, roots::WebPkiRoots, state::State};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use shin::asn1::{Reader, Tag};
 use shin::cert::{Cert, SubjectPublicKeyInfo};
@@ -13,13 +13,13 @@ const HOSTNAME: &str = "host.local";
 
 fn extract_ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
     let mut r = Reader::new(pkcs8);
-    let inner = r.expect(Tag::SEQUENCE).ok()?;
+    let inner = r.read_tagged(Tag::SEQUENCE).ok()?;
     let mut ir = Reader::new(inner);
-    let _version = ir.expect(Tag::INTEGER).ok()?;
-    let _alg = ir.expect(Tag::SEQUENCE).ok()?;
-    let outer_oct = ir.expect(Tag::OCTET_STRING).ok()?;
+    let _version = ir.read_tagged(Tag::INTEGER).ok()?;
+    let _alg = ir.read_tagged(Tag::SEQUENCE).ok()?;
+    let outer_oct = ir.read_tagged(Tag::OCTET_STRING).ok()?;
     let mut or = Reader::new(outer_oct);
-    let inner_oct = or.expect(Tag::OCTET_STRING).ok()?;
+    let inner_oct = or.read_tagged(Tag::OCTET_STRING).ok()?;
     if inner_oct.len() != 32 {
         return None;
     }
@@ -45,7 +45,7 @@ fn ed25519_self_signed() -> (Vec<u8>, SigningKey) {
 
 #[test]
 fn webpki_roots_returns_nonempty_anchor_pool() {
-    let pool = WebpkiRoots::anchors();
+    let pool: Vec<_> = WebPkiRoots::new().collect();
     assert!(
         pool.len() > 50,
         "expected >= 50 Mozilla roots, got {}",
@@ -59,7 +59,7 @@ fn webpki_roots_returns_nonempty_anchor_pool() {
 
 #[test]
 fn webpki_roots_spki_round_trips_through_verifier_parse() {
-    let pool = WebpkiRoots::anchors();
+    let pool: Vec<_> = WebPkiRoots::new().collect();
     assert!(!pool.is_empty());
     for ta in &pool {
         let spki = SubjectPublicKeyInfo::parse_standalone(&ta.spki_der).unwrap_or_else(|e| {
@@ -103,7 +103,8 @@ fn x509_handshake_round_trip() {
         alpn_protocols: Vec::new(),
         ticket_keys: None,
         accept_early_data: false,
-    });
+    })
+    .expect("valid server buffer layout");
     let mut client = State::new_client_with_clock(
         shin::client::Config {
             verifier: Verifier::X509 {

@@ -1,9 +1,5 @@
 #![cfg(feature = "rustls")]
 
-//! In-memory rustls crypto/config checks with a paired `ServerConnection` +
-//! `ClientConnection`. Full `RustTls` `Wire` I/O over the io_uring runtime lives
-//! in `rustls_e2e.rs`.
-
 use std::io::{Read, Write};
 use std::sync::Arc;
 
@@ -54,13 +50,10 @@ fn client_config(pki: &Pki) -> Arc<ClientConfig> {
     Arc::new(cfg)
 }
 
-/// Shuttle all pending ciphertext between the two connections until both sides
-/// stop wanting to write.
 fn pump(client: &mut ClientConnection, server: &mut ServerConnection) {
     for _ in 0..32 {
         let mut progressed = false;
 
-        // client -> server
         while client.wants_write() {
             let mut buf = Vec::new();
             client.write_tls(&mut buf).expect("client write_tls");
@@ -75,7 +68,6 @@ fn pump(client: &mut ClientConnection, server: &mut ServerConnection) {
             progressed = true;
         }
 
-        // server -> client
         while server.wants_write() {
             let mut buf = Vec::new();
             server.write_tls(&mut buf).expect("server write_tls");
@@ -96,7 +88,6 @@ fn pump(client: &mut ClientConnection, server: &mut ServerConnection) {
     }
 }
 
-/// Total (header + body) length of each concatenated TLS record in `wire`.
 fn record_lengths(mut wire: &[u8]) -> Vec<usize> {
     let mut lens = Vec::new();
     while wire.len() >= 5 {
@@ -109,9 +100,6 @@ fn record_lengths(mut wire: &[u8]) -> Vec<usize> {
     lens
 }
 
-// `RustTls::egress_has_record_room` reserves `MAX_TLS_RECORD` of egress before
-// letting rustls produce a record. Pin the assumption that backs that constant:
-// every record rustls actually emits fits within it (and full-size ones occur).
 #[test]
 fn rustls_records_fit_max_tls_record() {
     use shin::record::{HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY};
@@ -168,7 +156,6 @@ fn handshake_alpn_and_echo() {
     assert_eq!(client.alpn_protocol(), Some(ALPN), "client ALPN");
     assert_eq!(server.alpn_protocol(), Some(ALPN), "server ALPN");
 
-    // Client -> server application message, echoed back.
     let msg = b"hello rustls wire";
     client.writer().write_all(msg).expect("client app write");
     pump(&mut client, &mut server);
@@ -180,7 +167,6 @@ fn handshake_alpn_and_echo() {
         .expect("server read app");
     assert_eq!(&got, msg, "server received plaintext");
 
-    // Echo back.
     server.writer().write_all(&got).expect("server echo write");
     pump(&mut client, &mut server);
 
@@ -192,25 +178,22 @@ fn handshake_alpn_and_echo() {
     assert_eq!(&echoed, msg, "client received echo");
 }
 
-mod wire_unit {
-    //! Unit tests of the parts of `RustTls` that do not require a `Core`:
-    //! construction and pre-handshake application buffering.
-
+mod endpoint {
     use std::sync::Arc;
 
-    use dope::wire::Wire;
-    use dope_tls::{RustTls, RustTlsEndpoint};
+    use dope_net::wire::{RuntimeLimits, Wire};
+    use dope_tls::rustls::{RustTls, RustTlsEndpoint};
     use rustls::pki_types::ServerName;
 
     use super::{client_config, install_provider, make_pki, server_config};
 
     #[test]
     fn none_endpoint_is_default_and_closes() {
-        // Default is None; constructing from it yields a wire with nothing to
-        // negotiate (it will flag itself for close internally).
         let ep = RustTlsEndpoint::default();
         assert!(matches!(ep, RustTlsEndpoint::None));
-        let wire = RustTls::new(&ep);
+        let runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024))
+            .expect("valid test runtime limits");
+        let (wire, _) = RustTls::open(&ep, &runtime).expect("wire scratch budget");
         assert!(wire.alpn_protocol().is_none());
     }
 
@@ -219,8 +202,9 @@ mod wire_unit {
         install_provider();
         let pki = make_pki();
         let ep = RustTlsEndpoint::Server(server_config(&pki));
-        let wire = RustTls::new(&ep);
-        // No handshake yet, so no ALPN.
+        let runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024))
+            .expect("valid test runtime limits");
+        let (wire, _) = RustTls::open(&ep, &runtime).expect("wire scratch budget");
         assert!(wire.alpn_protocol().is_none());
     }
 
@@ -234,11 +218,10 @@ mod wire_unit {
             config: cfg,
             server_name: name,
         };
-        // A freshly constructed client should have staged a ClientHello into
-        // egress; `process_recv(&[])` should drain nothing new but not panic.
-        let mut wire = RustTls::new(&ep);
-        let out = wire.process_recv(&[]);
-        // No inbound ciphertext, so no decrypted plaintext is produced.
+        let runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024))
+            .expect("valid test runtime limits");
+        let (mut wire, _) = RustTls::open(&ep, &runtime).expect("wire scratch budget");
+        let out = wire.process_recv(&runtime, &[]);
         assert!(out.is_none());
     }
 }

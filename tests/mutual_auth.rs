@@ -1,9 +1,10 @@
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use common::{pump, signing_key};
-use dope_tls::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity, State};
+use dope_tls::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity, state::State};
 
 const CERT_TYPE_RAW_PUBLIC_KEY: u8 = 2;
 
@@ -16,12 +17,12 @@ struct Seen {
 
 struct PinnedVerifier {
     expected_spki: Vec<u8>,
-    seen: Mutex<Seen>,
+    seen: RefCell<Seen>,
 }
 
 impl ClientCertVerifier for PinnedVerifier {
     fn verify(&self, identity: &ClientIdentity<'_>) -> bool {
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = self.seen.borrow_mut();
         seen.cert_type = identity.cert_type;
         seen.spki_der = identity.spki_der.to_vec();
         seen.calls += 1;
@@ -63,7 +64,7 @@ fn round_trip(sender: &mut State, receiver: &mut State, msg: &[u8]) {
     sender.write_app(msg).unwrap();
     let wire = sender.pull_send();
     receiver.read_tcp(&wire).unwrap();
-    assert_eq!(receiver.take_app(), msg);
+    assert_eq!(receiver.pull_app().unwrap().as_slice(), msg);
 }
 
 #[test]
@@ -75,16 +76,17 @@ fn required_client_auth_completes_and_pins_spki() {
     let client_pubkey = *client_signing.pubkey().unwrap();
     let expected_spki = client_spki(client_pubkey);
 
-    let verifier = Arc::new(PinnedVerifier {
+    let verifier = Rc::new(PinnedVerifier {
         expected_spki: expected_spki.clone(),
-        seen: Mutex::new(Seen::default()),
+        seen: RefCell::new(Seen::default()),
     });
 
     let mut server = State::new_server_mutual(
         server_config(server_signing),
         ClientAuth::Required,
         verifier.clone(),
-    );
+    )
+    .expect("valid server buffer layout");
     let mut client = State::new_client_mutual(
         client_config(server_pubkey),
         ClientCertSource::RawPublicKey {
@@ -98,7 +100,7 @@ fn required_client_auth_completes_and_pins_spki() {
     assert!(client.is_established(), "client handshake must complete");
     assert!(server.is_established(), "server handshake must complete");
 
-    let seen = verifier.seen.lock().unwrap();
+    let seen = verifier.seen.borrow();
     assert_eq!(seen.calls, 1, "verifier must be invoked exactly once");
     assert_eq!(seen.cert_type, CERT_TYPE_RAW_PUBLIC_KEY);
     assert_eq!(
@@ -116,16 +118,17 @@ fn required_server_rejects_anonymous_client() {
     let server_signing = signing_key();
     let server_pubkey = *server_signing.pubkey().unwrap();
 
-    let verifier = Arc::new(PinnedVerifier {
+    let verifier = Rc::new(PinnedVerifier {
         expected_spki: vec![0u8; 44],
-        seen: Mutex::new(Seen::default()),
+        seen: RefCell::new(Seen::default()),
     });
 
     let mut server = State::new_server_mutual(
         server_config(server_signing),
         ClientAuth::Required,
         verifier.clone(),
-    );
+    )
+    .expect("valid server buffer layout");
     let mut client = State::new_client(client_config(server_pubkey)).unwrap();
 
     pump(&mut client, &mut server);
@@ -136,7 +139,7 @@ fn required_server_rejects_anonymous_client() {
     );
     assert!(server.is_closed());
     assert_eq!(
-        verifier.seen.lock().unwrap().calls,
+        verifier.seen.borrow().calls,
         0,
         "verifier is never reached for an empty client Certificate"
     );
@@ -151,16 +154,17 @@ fn required_server_rejects_unauthorized_client() {
     let authorized_pubkey = *authorized_signing.pubkey().unwrap();
     let expected_spki = client_spki(authorized_pubkey);
 
-    let verifier = Arc::new(PinnedVerifier {
+    let verifier = Rc::new(PinnedVerifier {
         expected_spki,
-        seen: Mutex::new(Seen::default()),
+        seen: RefCell::new(Seen::default()),
     });
 
     let mut server = State::new_server_mutual(
         server_config(server_signing),
         ClientAuth::Required,
         verifier.clone(),
-    );
+    )
+    .expect("valid server buffer layout");
 
     let other_signing = signing_key();
     let mut client = State::new_client_mutual(
@@ -179,7 +183,7 @@ fn required_server_rejects_unauthorized_client() {
     );
     assert!(server.is_closed());
     assert_eq!(
-        verifier.seen.lock().unwrap().calls,
+        verifier.seen.borrow().calls,
         1,
         "verifier must be consulted and reject the unauthorized identity"
     );

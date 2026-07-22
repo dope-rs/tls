@@ -1,8 +1,42 @@
 #![allow(dead_code)]
 
-use dope_tls::State;
+use std::net::{SocketAddr, TcpStream};
+use std::pin::Pin;
+use std::task::Poll;
+use std::time::{Duration, Instant};
+
+use dope::runtime::{Dispatcher, Session};
+use dope_fiber::SessionExt as _;
+use dope_tls::{clock::WallClock, state::State};
 use ring::rand::{SecureRandom, SystemRandom};
 use shin::sig::SigningKey;
+
+pub(crate) fn wait_for_addr(addr: SocketAddr) -> TcpStream {
+    for _ in 0..200 {
+        if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+            return s;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("could not connect to {addr}");
+}
+
+pub(crate) fn drive_until<'d, D: Dispatcher<'d>, F: FnMut() -> bool + 'static>(
+    sess: &mut Session<'_, 'd>,
+    app: Pin<&o3::cell::BrandCell<'d, D>>,
+    mut done: F,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fiber = dope_fiber::poll_fn(move |cx| {
+        if done() || Instant::now() >= deadline {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake();
+            Poll::Pending
+        }
+    });
+    sess.block_on(app, fiber).unwrap();
+}
 
 pub(crate) fn signing_key() -> SigningKey {
     let mut seed = [0u8; 32];
@@ -18,6 +52,7 @@ pub(crate) fn raw_server(signing_key: SigningKey) -> State {
         ticket_keys: None,
         accept_early_data: false,
     })
+    .expect("valid server buffer layout")
 }
 
 pub(crate) fn raw_client(server_pubkey: [u8; 32]) -> State {
@@ -52,7 +87,7 @@ pub(crate) fn raw_pair_with_suites(suites: &[shin::record::CipherSuite]) -> (Sta
             resumption: None,
             enable_early_data: false,
         },
-        dope_tls::WallClock::System,
+        WallClock::System,
         |c| c.set_cipher_suites(suites),
     )
     .unwrap();

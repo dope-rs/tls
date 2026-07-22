@@ -1,7 +1,7 @@
 mod common;
 
 use common::{established_pair, raw_client, signing_key};
-use dope_tls::{Error, PeerClose};
+use dope_tls::{error::Error, state::status::PeerClose};
 use shin::alert::{Alert, AlertDescription};
 
 #[test]
@@ -36,7 +36,7 @@ fn fatal_alert_surfaces_description_and_closes() {
 fn eof_without_close_notify_is_truncation() {
     let (client, mut server) = established_pair();
     drop(client);
-    assert_eq!(server.on_peer_eof().unwrap_err(), Error::Truncated);
+    assert_eq!(server.peer_eof().unwrap_err(), Error::Truncated);
     assert_eq!(server.peer_close(), PeerClose::Truncated);
     assert!(server.is_closed());
 }
@@ -47,7 +47,7 @@ fn eof_after_close_notify_is_clean() {
     client.send_close_notify().unwrap();
     let wire = client.pull_send();
     server.read_tcp(&wire).unwrap();
-    server.on_peer_eof().unwrap();
+    server.peer_eof().unwrap();
     assert_eq!(server.peer_close(), PeerClose::CloseNotify);
 }
 

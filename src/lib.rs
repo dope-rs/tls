@@ -1,17 +1,13 @@
-mod memstats;
-mod pool;
+pub mod clock;
+pub mod error;
+pub mod roots;
+mod send;
 mod staging;
 pub mod state;
-pub mod webpki_roots;
-pub mod wire;
+pub mod tls;
 
 #[cfg(feature = "rustls")]
-pub mod rustls_wire;
+pub mod rustls;
 
-#[cfg(feature = "rustls")]
-pub use rustls_wire::{RustTls, RustTlsEndpoint};
 pub use shin::client::ClientCertSource;
 pub use shin::server::{ClientAuth, ClientCertVerifier, ClientIdentity};
-pub use state::{Error, PeerClose, Phase, State, WallClock};
-pub use webpki_roots::WebpkiRoots;
-pub use wire::{ConnState, Endpoint, Tls};

@@ -1,7 +1,7 @@
 mod common;
 
 use common::established_pair;
-use dope_tls::Error;
+use dope_tls::error::Error;
 use shin::record::RecordError;
 
 #[test]

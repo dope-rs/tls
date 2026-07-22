@@ -20,7 +20,7 @@ fn large_app_write_fragments_without_panic() {
         for chunk in ciphertext.chunks(8192) {
             server.read_tcp(chunk).expect("server.read_tcp");
             while let Some(app) = server.pull_app() {
-                received.extend_from_slice(&app);
+                received.extend_from_slice(app.as_slice());
             }
         }
         assert!(
@@ -29,7 +29,7 @@ fn large_app_write_fragments_without_panic() {
         );
     }
     while let Some(app) = server.pull_app() {
-        received.extend_from_slice(&app);
+        received.extend_from_slice(app.as_slice());
     }
 
     assert_eq!(sent_plain, payload.len());
@@ -54,7 +54,7 @@ fn oversized_app_write_backpressures_without_panic() {
         let ciphertext = client.pull_send();
         server.read_tcp(&ciphertext).expect("server.read_tcp");
         while let Some(app) = server.pull_app() {
-            received.extend_from_slice(&app);
+            received.extend_from_slice(app.as_slice());
         }
         if n == 0 {
             break;

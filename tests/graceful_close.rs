@@ -5,90 +5,77 @@ use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::time::Duration;
 
-use dope::fiber::Fiber;
+use dope::DriverContext;
 use dope::manifold::Outcome;
 use dope::manifold::env::Bundle;
-use dope::manifold::listener::config::Config;
-use dope::manifold::listener::{self, Application, Listener};
+use dope::manifold::listener::{self, Application, Listener, SlotEgress};
+use dope::runtime::Executor;
 use dope::runtime::profile;
-use dope::transport::Tcp;
-use dope::transport::config::tcp::ListenerOpts;
-use dope::transport::link::Slot;
-use dope::transport::wire::RecvChunk;
-use dope::{Driver, DriverConfig, Executor};
-use dope_tls::{Endpoint, PeerClose, State, Tls};
+use dope_net::link::slot::Slot;
+use dope_net::tcp::Tcp;
+use dope_tls::{
+    state::{State, status::PeerClose},
+    tls::{Endpoint, Tls},
+};
+use o3::buffer::RetainBytes;
 
 mod common;
-use common::signing_key;
+use common::{drive_until, signing_key, wait_for_addr};
+
+const REPLY_LEN: usize = 50_000;
 
 struct ReplyApp {
+    payload: Vec<u8>,
     closes: Rc<Cell<u32>>,
 }
 
-impl Application for ReplyApp {
+impl<'d> Application<'d> for ReplyApp {
     type Conn = ();
     type Wire = Tls;
 
-    fn on_chunk(
-        &mut self,
-        _slot: &mut Slot<Self::Wire, listener::State<Self::Conn>>,
-        _chunk: RecvChunk<'_>,
-        _aux: &mut listener::Aux,
-        _driver: &mut Driver,
+    fn chunk<R: RetainBytes>(
+        self: Pin<&mut Self>,
+        slot: &mut Slot<'d, Self::Wire, listener::State<Self::Conn>>,
+        _chunk: R,
+        aux: &mut listener::Aux,
+        driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
+        let payload = &self.get_mut().payload;
+        let buf = aux.write_buf_for(slot);
+        let body = o3::buffer::Shared::copy_from_slice(payload);
+        let ud = slot.token();
+        slot.submit_split_shared(buf, 0, body, ud, driver);
         Outcome::CloseAfter
     }
 
-    fn on_send(
-        &mut self,
-        _slot: &mut Slot<Self::Wire, listener::State<Self::Conn>>,
+    fn send(
+        self: Pin<&mut Self>,
+        _slot: &mut Slot<'d, Self::Wire, listener::State<Self::Conn>>,
         _sent: usize,
         _aux: &mut listener::Aux,
-        _driver: &mut Driver,
+        _driver: &mut DriverContext<'_, 'd>,
     ) {
     }
 
-    fn on_close(
-        &mut self,
-        _slot: &mut Slot<Self::Wire, listener::State<Self::Conn>>,
+    fn close(
+        self: Pin<&mut Self>,
+        _slot: &mut Slot<'d, Self::Wire, listener::State<Self::Conn>>,
         _aux: &mut listener::Aux,
     ) {
-        self.closes.set(self.closes.get() + 1);
+        let closes = &self.get_mut().closes;
+        closes.set(closes.get() + 1);
     }
 }
 
 #[pin_project::pin_project]
 #[derive(dope_gen::Dispatcher)]
-struct App {
+struct App<'d> {
     #[pin]
     #[manifold]
-    listener: Listener<0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>,
+    listener: Listener<'d, 0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>,
 }
 
-fn wait_for_addr(addr: SocketAddr) -> TcpStream {
-    for _ in 0..200 {
-        if let Ok(s) = TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
-            return s;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    panic!("could not connect to {addr}");
-}
-
-fn drive_until<F: FnMut() -> bool + 'static>(exec: &mut Executor, app: Pin<&mut App>, mut done: F) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let fiber = Fiber::new(std::future::poll_fn(move |cx| {
-        if done() || std::time::Instant::now() >= deadline {
-            std::task::Poll::Ready(())
-        } else {
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    }));
-    dope_extra::block_on(exec, app, fiber);
-}
-
-fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> PeerClose {
+fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u8>) {
     let mut client = State::new_client(shin::client::Config {
         verifier: shin::client::Verifier::RawPublicKey {
             expected_pubkey: server_pubkey,
@@ -128,17 +115,20 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> PeerClose {
         sock.write_all(&req).expect("write request");
     }
 
+    let mut received = Vec::with_capacity(REPLY_LEN);
     for _ in 0..64 {
         match sock.read(&mut buf) {
             Ok(0) => {
-                let _ = client.on_peer_eof();
+                let _ = client.peer_eof();
                 break;
             }
             Ok(n) => {
                 if client.read_tcp(&buf[..n]).is_err() {
                     break;
                 }
-                let _ = client.pull_app();
+                while let Some(chunk) = client.pull_app() {
+                    received.extend_from_slice(chunk.as_slice());
+                }
             }
             Err(_) => {
                 if client.peer_close() != PeerClose::Open {
@@ -147,7 +137,7 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> PeerClose {
             }
         }
     }
-    client.peer_close()
+    (client.peer_close(), received)
 }
 
 #[test]
@@ -156,26 +146,33 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
     let server_pubkey = *signing.pubkey().unwrap();
     let closes = Rc::new(Cell::new(0u32));
 
-    let cfg = <dope::DriverCfg as DriverConfig>::for_tcp_profile::<profile::Throughput>(16);
-    let mut exec = Executor::new(cfg).expect("executor");
-
+    let cfg = dope::driver::Config::for_tcp_profile::<profile::Throughput>(16);
+    let exec = Executor::new(cfg).expect("executor");
+    exec.enter(|mut sess| {
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("bind");
-    let listener_cfg = Config::<Tcp> {
-        max_conn: 16,
+    let listener_cfg = listener::Config::<Tcp> {
+        max_connections: 16,
         bind,
         backlog: 128,
-        stream_opts: Default::default(),
-        listener_opts: ListenerOpts::default(),
+        stream: Default::default(),
+        transport: Default::default(),
+        egress: Default::default(),
     };
-    let mut listener = Listener::<0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>::open_in(
-        ReplyApp {
-            closes: closes.clone(),
-        },
-        listener_cfg,
-        exec.driver_mut(),
-    )
-    .expect("open_in");
-    listener.set_cfg(Endpoint::Server(Box::new(shin::server::Config {
+    let hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
+    let mut listener = {
+        let mut driver = sess.driver_access();
+        Listener::<0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>::open_in(
+            ReplyApp {
+                payload: (0..REPLY_LEN as u32).map(|i| (i % 251) as u8).collect(),
+                closes: closes.clone(),
+            },
+            listener_cfg,
+            hash,
+            &mut driver,
+        )
+        .expect("open_in")
+    };
+    listener.set_config(Endpoint::Server(Box::new(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing,
         },
@@ -185,7 +182,7 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
         accept_early_data: false,
     })));
     let addr = listener.local_addr().expect("local_addr");
-    let mut app = pin!(App { listener });
+    let app = pin!(o3::cell::BrandCell::new(App { listener }));
 
     let client = std::thread::spawn(move || {
         let sock = wait_for_addr(addr);
@@ -193,13 +190,16 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
     });
 
     let closes_done = closes.clone();
-    drive_until(&mut exec, app.as_mut(), move || closes_done.get() >= 1);
+    drive_until(&mut sess, app.as_ref(), move || closes_done.get() >= 1);
 
-    let peer_close = client.join().expect("client join");
+    let (peer_close, received) = client.join().expect("client join");
     assert_eq!(
         peer_close,
         PeerClose::CloseNotify,
         "a graceful server close must emit a close_notify before the FIN, not a bare FIN (Truncated)"
     );
+    let expected: Vec<u8> = (0..REPLY_LEN as u32).map(|i| (i % 251) as u8).collect();
+    assert_eq!(received, expected, "multi-record reply must precede close_notify");
     assert_eq!(closes.get(), 1, "connection must close exactly once");
+    });
 }
