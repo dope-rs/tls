@@ -1,6 +1,6 @@
 [package]
 name = "dope-tls"
-version = "0.13.0"
+version = "0.15.0"
 edition = "2024"
 rust-version = "1.95"
 description = "TCP TLS streams for dope runtime, shin-backed"
@@ -10,7 +10,7 @@ readme = "README.md"
 
 [dependencies]
 shin = "0.10"
-dope-net = "0.9"
+dope-net = "0.10.0"
 webpki-roots = "1.0"
 rustls = { version = "0.23", optional = true }
 
@@ -18,11 +18,10 @@ rustls = { version = "0.23", optional = true }
 rustls = ["dep:rustls"]
 
 [dev-dependencies]
-dope = "0.9"
-o3 = "0.6"
+dope = "0.10"
 ring = "0.17"
 rcgen = "0.14"
-dope-extra = "0.9"
-dope-fiber = "0.9"
-dope-gen = "0.9"
+dope-extra = "0.10"
+dope-fiber = "0.10"
+dope-gen = "0.10.0"
 pin-project = "1"

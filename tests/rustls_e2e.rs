@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::pin::{Pin, pin};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +16,8 @@ use dope::runtime::Executor;
 use dope::runtime::profile;
 use dope_net::link::slot::Slot;
 use dope_net::tcp::Tcp;
+use dope_net::{Bytes, RetainBytes};
 use dope_tls::rustls::{RustTls, RustTlsEndpoint};
-use o3::buffer::RetainBytes;
 use rcgen::{KeyPair, PKCS_ED25519};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig};
@@ -91,7 +91,7 @@ impl<'d> Application<'d> for ReplyApp {
     ) -> Outcome {
         let payload = &self.get_mut().payload;
         let buf = aux.write_buf_for(slot);
-        let body = o3::buffer::Shared::copy_from_slice(payload);
+        let body = Bytes::copy_from_slice(payload).into_shared();
         let ud = slot.token();
         slot.submit_split_shared(buf, 0, body, ud, driver);
         Outcome::CloseAfter
@@ -161,8 +161,6 @@ fn rustls_wire_multi_record_reply_round_trips() {
         };
         listener.set_config(RustTlsEndpoint::Server(server_cfg));
         let addr = listener.local_addr().expect("local_addr");
-        let app = pin!(o3::cell::BrandCell::new(App { listener }));
-
         let client = std::thread::spawn(move || {
             let name = ServerName::try_from("localhost").expect("name");
             let mut conn = ClientConnection::new(client_cfg, name).expect("client conn");
@@ -179,7 +177,9 @@ fn rustls_wire_multi_record_reply_round_trips() {
         });
 
         let closes_done = closes.clone();
-        drive_until(&mut sess, app.as_ref(), move || closes_done.get() >= 1);
+        sess.with_app(App { listener }, |mut app| {
+            drive_until(&mut app, move || closes_done.get() >= 1);
+        });
 
         let (ok, closed, got) = client.join().expect("client join");
         assert!(ok, "client could not read the full {REPLY_LEN}-byte reply");

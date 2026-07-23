@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::pin::{Pin, pin};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -13,11 +13,11 @@ use dope::runtime::Executor;
 use dope::runtime::profile;
 use dope_net::link::slot::Slot;
 use dope_net::tcp::Tcp;
+use dope_net::{Bytes, RetainBytes};
 use dope_tls::{
     state::{State, status::PeerClose},
     tls::{Endpoint, Tls},
 };
-use o3::buffer::RetainBytes;
 
 mod common;
 use common::{drive_until, signing_key, wait_for_addr};
@@ -42,7 +42,7 @@ impl<'d> Application<'d> for ReplyApp {
     ) -> Outcome {
         let payload = &self.get_mut().payload;
         let buf = aux.write_buf_for(slot);
-        let body = o3::buffer::Shared::copy_from_slice(payload);
+        let body = Bytes::copy_from_slice(payload).into_shared();
         let ud = slot.token();
         slot.submit_split_shared(buf, 0, body, ud, driver);
         Outcome::CloseAfter
@@ -182,15 +182,15 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
         accept_early_data: false,
     })));
     let addr = listener.local_addr().expect("local_addr");
-    let app = pin!(o3::cell::BrandCell::new(App { listener }));
-
     let client = std::thread::spawn(move || {
         let sock = wait_for_addr(addr);
         run_client(sock, server_pubkey)
     });
 
     let closes_done = closes.clone();
-    drive_until(&mut sess, app.as_ref(), move || closes_done.get() >= 1);
+    sess.with_app(App { listener }, |mut app| {
+        drive_until(&mut app, move || closes_done.get() >= 1);
+    });
 
     let (peer_close, received) = client.join().expect("client join");
     assert_eq!(

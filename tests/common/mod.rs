@@ -1,12 +1,11 @@
 #![allow(dead_code)]
 
 use std::net::{SocketAddr, TcpStream};
-use std::pin::Pin;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use dope::runtime::{Dispatcher, Session};
-use dope_fiber::SessionExt as _;
+use dope::runtime::{AppSession, Dispatcher};
+use dope_fiber::AppSessionExt as _;
 use dope_tls::{clock::WallClock, state::State};
 use ring::rand::{SecureRandom, SystemRandom};
 use shin::sig::SigningKey;
@@ -21,9 +20,8 @@ pub(crate) fn wait_for_addr(addr: SocketAddr) -> TcpStream {
     panic!("could not connect to {addr}");
 }
 
-pub(crate) fn drive_until<'d, D: Dispatcher<'d>, F: FnMut() -> bool + 'static>(
-    sess: &mut Session<'_, 'd>,
-    app: Pin<&o3::cell::BrandCell<'d, D>>,
+pub(crate) fn drive_until<'d, S, D: Dispatcher<'d>, F: FnMut() -> bool + 'static>(
+    app: &mut AppSession<'_, '_, 'd, S, D>,
     mut done: F,
 ) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -35,7 +33,7 @@ pub(crate) fn drive_until<'d, D: Dispatcher<'d>, F: FnMut() -> bool + 'static>(
             Poll::Pending
         }
     });
-    sess.block_on(app, fiber).unwrap();
+    app.block_on(fiber).unwrap();
 }
 
 pub(crate) fn signing_key() -> SigningKey {
