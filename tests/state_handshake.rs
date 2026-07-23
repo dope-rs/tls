@@ -1,18 +1,16 @@
 mod common;
 
 use common::{established_pair, pump, raw_pair, signing_key};
-use dope_tls::{error::Error, state::State};
+use dope_tls::{error::Error, tls::Endpoint};
 
 #[test]
 fn invalid_server_config_is_rejected_before_handshake() {
-    let error = State::new_server(shin::server::Config {
+    let error = Endpoint::server(shin::server::Config {
         source: shin::server::CertSource::RawPublicKey {
             signing_key: signing_key(),
         },
-        transport_params: Vec::new(),
         alpn_protocols: vec![Vec::new()],
         ticket_keys: None,
-        accept_early_data: false,
     })
     .err()
     .expect("invalid server configuration");
@@ -139,7 +137,7 @@ fn fragmented_tcp_input_is_buffered_correctly() {
 
     let s_bytes = server.pull_send();
     for chunk in s_bytes.chunks(7) {
-        client.read_tcp(chunk).unwrap();
+        client.read_client_tcp(chunk).unwrap();
     }
 
     let cf_bytes = client.pull_send();

@@ -23,7 +23,7 @@ fn fatal_alert_surfaces_description_and_closes() {
         .send_fatal_alert(AlertDescription::HandshakeFailure)
         .unwrap();
     let wire = server.pull_send();
-    let err = client.read_tcp(&wire).unwrap_err();
+    let err = client.read_client_tcp(&wire).unwrap_err();
     assert_eq!(err, Error::PeerAlert(AlertDescription::HandshakeFailure));
     assert_eq!(
         client.peer_close(),
@@ -74,7 +74,10 @@ fn malformed_plaintext_alert_is_fatal() {
     let mut client = raw_client(server_pubkey);
     let _ = client.pull_send();
     let rec = [21u8, 0x03, 0x03, 0x00, 0x01, 0x01];
-    assert_eq!(client.read_tcp(&rec).unwrap_err(), Error::MalformedAlert);
+    assert_eq!(
+        client.read_client_tcp(&rec).unwrap_err(),
+        Error::MalformedAlert
+    );
     assert!(client.is_closed());
 }
 
@@ -85,7 +88,7 @@ fn plaintext_close_notify_is_rejected_not_clean() {
     let _ = client.pull_send();
     let rec = [21u8, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00];
     assert_eq!(
-        client.read_tcp(&rec).unwrap_err(),
+        client.read_client_tcp(&rec).unwrap_err(),
         Error::PeerAlert(AlertDescription::CloseNotify)
     );
     assert_eq!(

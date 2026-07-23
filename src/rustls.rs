@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use dope_net::wire::send::{Plain, Prepared, Storage, Vectored};
 use dope_net::wire::{
-    Reclaim, RuntimeLimits, Wire,
+    ReadyOpen, Reclaim, RuntimeLimits, Wire,
     buffered::{Buffer, Buffered, Recv, Scratch},
 };
 use dope_net::{Bytes, Leased};
@@ -17,7 +17,7 @@ use crate::send::{SendProtocol, Sender};
 use crate::staging::TLS13_RECORD_OVERHEAD;
 use crate::tls::{SendState, Tls};
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub enum RustTlsEndpoint {
     #[default]
     None,
@@ -26,6 +26,11 @@ pub enum RustTlsEndpoint {
         config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
     },
+}
+
+pub struct RustTlsRuntime {
+    buffers: Buffered,
+    endpoint: RustTlsEndpoint,
 }
 
 struct ConnectionState {
@@ -313,7 +318,8 @@ impl SendProtocol for RustTls {
 
 impl Wire for RustTls {
     type InitConfig = RustTlsEndpoint;
-    type RuntimeContext = Buffered;
+    type RuntimeContext = RustTlsRuntime;
+    type Open<'a> = ReadyOpen<Self>;
     type Recv<'a> = Bytes<Leased>;
     type SendStorage = SendState;
 
@@ -328,14 +334,22 @@ impl Wire for RustTls {
                 .is_some_and(|conn| conn.wants_write())
     }
 
-    fn runtime_context(limits: RuntimeLimits) -> io::Result<Buffered> {
-        Tls::runtime_buffers(limits, 1)
+    fn runtime_context(
+        limits: RuntimeLimits,
+        endpoint: Self::InitConfig,
+    ) -> io::Result<Self::RuntimeContext> {
+        Ok(RustTlsRuntime {
+            buffers: Tls::<crate::tls::Standard, crate::tls::NoClients>::runtime_buffers(
+                limits, 1,
+            )?,
+            endpoint,
+        })
     }
 
-    fn open(cfg: &RustTlsEndpoint, runtime: &Buffered) -> Option<(Self, SendState)> {
-        let send = SendState(runtime.try_acquire_scratch()?);
+    fn prepare_open(runtime: &mut Self::RuntimeContext) -> Option<Self::Open<'_>> {
+        let send = SendState(runtime.buffers.try_acquire_scratch()?);
         let mut s = ConnectionState::empty();
-        let conn = match cfg {
+        let conn = match &runtime.endpoint {
             RustTlsEndpoint::Server(c) => ServerConnection::new(c.clone())
                 .ok()
                 .map(Connection::Server),
@@ -349,7 +363,7 @@ impl Wire for RustTls {
         };
         s.close = conn.is_none();
         s.conn = conn;
-        Some((
+        Some(ReadyOpen::new(
             Self {
                 state: s,
                 send_inflight: false,
@@ -358,8 +372,12 @@ impl Wire for RustTls {
         ))
     }
 
-    fn process_recv<'a>(&mut self, runtime: &Buffered, bytes: &'a [u8]) -> Option<Self::Recv<'a>> {
-        let Some(mut data) = runtime.try_acquire_recv() else {
+    fn process_recv<'a>(
+        &mut self,
+        runtime: &mut Self::RuntimeContext,
+        bytes: &'a [u8],
+    ) -> Option<Self::Recv<'a>> {
+        let Some(mut data) = runtime.buffers.try_acquire_recv() else {
             self.state.close = true;
             return None;
         };

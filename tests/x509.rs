@@ -1,6 +1,6 @@
 mod common;
 
-use common::pump;
+use common::{TestServer, pump};
 use dope_tls::{clock::WallClock, roots::WebPkiRoots, state::State};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use shin::asn1::{Reader, Tag};
@@ -94,17 +94,22 @@ fn x509_handshake_round_trip() {
     let now = (nb.0 + na.0) / 2;
     let anchor = OwnedTrustAnchor::from_cert_der(&cert_der).unwrap();
 
-    let mut server = State::new_server(shin::server::Config {
+    let server_config = shin::server::Config {
         source: CertSource::X509 {
             chain_der: vec![cert_der.clone()],
             signing_key: signing,
         },
-        transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-        accept_early_data: false,
-    })
-    .expect("valid server buffer layout");
+    };
+    server_config.validate().unwrap();
+    let mut server = TestServer::new(
+        State::new_server(shin::server::ConnectionConfig {
+            transport_params: Vec::new(),
+        })
+        .expect("valid server buffer layout"),
+        shin::server::Shard::new(server_config),
+    );
     let mut client = State::new_client_with_clock(
         shin::client::Config {
             verifier: Verifier::X509 {

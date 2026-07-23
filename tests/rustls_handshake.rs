@@ -181,7 +181,7 @@ fn handshake_alpn_and_echo() {
 mod endpoint {
     use std::sync::Arc;
 
-    use dope_net::wire::{RuntimeLimits, Wire};
+    use dope_net::wire::{OpenReservation, RuntimeLimits, Wire};
     use dope_tls::rustls::{RustTls, RustTlsEndpoint};
     use rustls::pki_types::ServerName;
 
@@ -191,9 +191,11 @@ mod endpoint {
     fn none_endpoint_is_default_and_closes() {
         let ep = RustTlsEndpoint::default();
         assert!(matches!(ep, RustTlsEndpoint::None));
-        let runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024))
+        let mut runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), ep)
             .expect("valid test runtime limits");
-        let (wire, _) = RustTls::open(&ep, &runtime).expect("wire scratch budget");
+        let (wire, _) = RustTls::prepare_open(&mut runtime)
+            .expect("wire scratch budget")
+            .commit();
         assert!(wire.alpn_protocol().is_none());
     }
 
@@ -202,9 +204,11 @@ mod endpoint {
         install_provider();
         let pki = make_pki();
         let ep = RustTlsEndpoint::Server(server_config(&pki));
-        let runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024))
+        let mut runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), ep)
             .expect("valid test runtime limits");
-        let (wire, _) = RustTls::open(&ep, &runtime).expect("wire scratch budget");
+        let (wire, _) = RustTls::prepare_open(&mut runtime)
+            .expect("wire scratch budget")
+            .commit();
         assert!(wire.alpn_protocol().is_none());
     }
 
@@ -218,10 +222,12 @@ mod endpoint {
             config: cfg,
             server_name: name,
         };
-        let runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024))
+        let mut runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), ep)
             .expect("valid test runtime limits");
-        let (mut wire, _) = RustTls::open(&ep, &runtime).expect("wire scratch budget");
-        let out = wire.process_recv(&runtime, &[]);
+        let (mut wire, _) = RustTls::prepare_open(&mut runtime)
+            .expect("wire scratch budget")
+            .commit();
+        let out = wire.process_recv(&mut runtime, &[]);
         assert!(out.is_none());
     }
 }

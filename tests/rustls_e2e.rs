@@ -146,20 +146,20 @@ fn rustls_wire_multi_record_reply_round_trips() {
             egress: Default::default(),
         };
         let hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-        let mut listener = {
+        let listener = {
             let mut driver = sess.driver_access();
-            Listener::<0, ReplyApp, Bundle<Tcp, RustTls, profile::Throughput>>::open_in(
+            Listener::<0, ReplyApp, Bundle<Tcp, RustTls, profile::Throughput>>::open_in_with_wire(
                 ReplyApp {
                     payload: want.clone(),
                     closes: closes.clone(),
                 },
                 listener_cfg,
+                RustTlsEndpoint::Server(server_cfg),
                 hash,
                 &mut driver,
             )
             .expect("open_in")
         };
-        listener.set_config(RustTlsEndpoint::Server(server_cfg));
         let addr = listener.local_addr().expect("local_addr");
         let client = std::thread::spawn(move || {
             let name = ServerName::try_from("localhost").expect("name");

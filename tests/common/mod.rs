@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::net::{SocketAddr, TcpStream};
+use std::ops::{Deref, DerefMut};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,51 @@ use dope_fiber::AppSessionExt as _;
 use dope_tls::{clock::WallClock, state::State};
 use ring::rand::{SecureRandom, SystemRandom};
 use shin::sig::SigningKey;
+
+pub(crate) struct TestServer<G = shin::server::NoGuard, V = shin::server::NoClientAuth>
+where
+    G: shin::server::EarlyDataGuard,
+    V: shin::server::ClientCertVerifier,
+{
+    state: State,
+    shard: shin::server::Shard<G, V>,
+}
+
+impl<G, V> TestServer<G, V>
+where
+    G: shin::server::EarlyDataGuard,
+    V: shin::server::ClientCertVerifier,
+{
+    pub(crate) fn new(state: State, shard: shin::server::Shard<G, V>) -> Self {
+        Self { state, shard }
+    }
+
+    pub(crate) fn read_tcp(&mut self, bytes: &[u8]) -> Result<(), dope_tls::error::Error> {
+        self.state.read_server_tcp(bytes, &mut self.shard)
+    }
+}
+
+impl<G, V> Deref for TestServer<G, V>
+where
+    G: shin::server::EarlyDataGuard,
+    V: shin::server::ClientCertVerifier,
+{
+    type Target = State;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl<G, V> DerefMut for TestServer<G, V>
+where
+    G: shin::server::EarlyDataGuard,
+    V: shin::server::ClientCertVerifier,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
 
 pub(crate) fn wait_for_addr(addr: SocketAddr) -> TcpStream {
     for _ in 0..200 {
@@ -42,15 +88,20 @@ pub(crate) fn signing_key() -> SigningKey {
     SigningKey::from_seed(&seed).unwrap()
 }
 
-pub(crate) fn raw_server(signing_key: SigningKey) -> State {
-    State::new_server(shin::server::Config {
+pub(crate) fn raw_server(signing_key: SigningKey) -> TestServer {
+    let config = shin::server::Config {
         source: shin::server::CertSource::RawPublicKey { signing_key },
-        transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-        accept_early_data: false,
-    })
-    .expect("valid server buffer layout")
+    };
+    config.validate().unwrap();
+    TestServer::new(
+        State::new_server(shin::server::ConnectionConfig {
+            transport_params: Vec::new(),
+        })
+        .expect("valid server buffer layout"),
+        shin::server::Shard::new(config),
+    )
 }
 
 pub(crate) fn raw_client(server_pubkey: [u8; 32]) -> State {
@@ -66,13 +117,13 @@ pub(crate) fn raw_client(server_pubkey: [u8; 32]) -> State {
     .unwrap()
 }
 
-pub(crate) fn raw_pair() -> (State, State) {
+pub(crate) fn raw_pair() -> (State, TestServer) {
     let signing = signing_key();
     let server_pubkey = *signing.pubkey().unwrap();
     (raw_client(server_pubkey), raw_server(signing))
 }
 
-pub(crate) fn raw_pair_with_suites(suites: &[shin::record::CipherSuite]) -> (State, State) {
+pub(crate) fn raw_pair_with_suites(suites: &[shin::record::CipherSuite]) -> (State, TestServer) {
     let signing = signing_key();
     let server_pubkey = *signing.pubkey().unwrap();
     let client = State::new_client_with(
@@ -92,7 +143,11 @@ pub(crate) fn raw_pair_with_suites(suites: &[shin::record::CipherSuite]) -> (Sta
     (client, raw_server(signing))
 }
 
-pub(crate) fn pump(client: &mut State, server: &mut State) {
+pub(crate) fn pump<G, V>(client: &mut State, server: &mut TestServer<G, V>)
+where
+    G: shin::server::EarlyDataGuard,
+    V: shin::server::ClientCertVerifier,
+{
     for _ in 0..16 {
         let from_client = client.pull_send();
         let from_server = server.pull_send();
@@ -101,7 +156,7 @@ pub(crate) fn pump(client: &mut State, server: &mut State) {
             let _ = server.read_tcp(&from_client);
         }
         if !from_server.is_empty() {
-            let _ = client.read_tcp(&from_server);
+            let _ = client.read_client_tcp(&from_server);
         }
         if !progressed {
             break;
@@ -109,7 +164,7 @@ pub(crate) fn pump(client: &mut State, server: &mut State) {
     }
 }
 
-pub(crate) fn established_pair() -> (State, State) {
+pub(crate) fn established_pair() -> (State, TestServer) {
     let (mut client, mut server) = raw_pair();
     pump(&mut client, &mut server);
     assert!(client.is_established() && server.is_established());

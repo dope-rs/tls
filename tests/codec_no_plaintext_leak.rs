@@ -38,7 +38,10 @@ fn tls_egress_handshake_then_app_record() {
         let from_server = server.pull_send();
         let progressed = !from_client.is_empty() || !from_server.is_empty();
         if !from_server.is_empty() {
-            assert!(client.try_read_tcp(&from_server), "client.try_read_tcp");
+            assert!(
+                client.try_read_client_tcp(&from_server),
+                "client.try_read_tcp"
+            );
             while let Some(_chunk) = client.pull_app() {}
             let next = client.pending_send_slice().to_vec();
             let nn = next.len();

@@ -19,6 +19,10 @@ use shin::record::CipherSuite;
 use shin::server::CertSource;
 use shin::sig::SigningKey;
 
+mod common;
+
+use common::TestServer;
+
 const HOSTNAME: &str = "interop.local";
 const PUMP_CAP: usize = 64;
 
@@ -30,7 +34,7 @@ fn install_provider() {
 
 struct Pki {
     cert_der: Vec<u8>,
-    signing: SigningKey,
+    signing_seed: [u8; 32],
     rustls_cert: CertificateDer<'static>,
     rustls_key: PrivateKeyDer<'static>,
     valid_at: u64,
@@ -55,8 +59,6 @@ fn make_pki() -> Pki {
     let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
     let pkcs8 = key.serialize_der();
     let seed = extract_ed25519_seed(&pkcs8);
-    let signing = SigningKey::from_seed(&seed).unwrap();
-
     let mut params = CertificateParams::new(vec![HOSTNAME.into()]).unwrap();
     params.distinguished_name.push(DnType::CommonName, HOSTNAME);
     params.is_ca = IsCa::NoCa;
@@ -73,7 +75,7 @@ fn make_pki() -> Pki {
         rustls_cert: CertificateDer::from(cert_der.clone()),
         rustls_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8)),
         cert_der,
-        signing,
+        signing_seed: seed,
         valid_at,
     }
 }
@@ -183,21 +185,60 @@ fn dope_client(pki: &Pki, suite: CipherSuite) -> State {
     .unwrap()
 }
 
-fn dope_server(pki: &Pki) -> State {
-    State::new_server(shin::server::Config {
+fn dope_server(pki: &Pki) -> TestServer {
+    let config = shin::server::Config {
         source: CertSource::X509 {
             chain_der: vec![pki.cert_der.clone()],
-            signing_key: pki.signing.clone(),
+            signing_key: SigningKey::from_seed(&pki.signing_seed).unwrap(),
         },
-        transport_params: Vec::new(),
         alpn_protocols: Vec::new(),
         ticket_keys: None,
-        accept_early_data: false,
-    })
-    .expect("valid server buffer layout")
+    };
+    config.validate().unwrap();
+    TestServer::new(
+        State::new_server(shin::server::ConnectionConfig {
+            transport_params: Vec::new(),
+        })
+        .expect("valid server buffer layout"),
+        shin::server::Shard::new(config),
+    )
 }
 
-fn pump<D>(dope: &mut State, peer: &mut rustls::ConnectionCommon<D>) {
+fn pump_client<D>(dope: &mut State, peer: &mut rustls::ConnectionCommon<D>) {
+    for _ in 0..PUMP_CAP {
+        let mut progressed = false;
+
+        let out = dope.pull_send();
+        if !out.is_empty() {
+            let mut cursor: &[u8] = &out;
+            while !cursor.is_empty() {
+                let n = peer.read_tls(&mut cursor).expect("peer read_tls");
+                peer.process_new_packets()
+                    .expect("peer process_new_packets");
+                if n == 0 {
+                    break;
+                }
+            }
+            progressed = true;
+        }
+
+        while peer.wants_write() {
+            let mut buf = Vec::new();
+            peer.write_tls(&mut buf).expect("peer write_tls");
+            if buf.is_empty() {
+                break;
+            }
+            dope.read_client_tcp(&buf).expect("dope read_tcp");
+            progressed = true;
+        }
+
+        if !progressed {
+            break;
+        }
+    }
+}
+
+fn pump_server<D>(dope: &mut TestServer, peer: &mut rustls::ConnectionCommon<D>) {
     for _ in 0..PUMP_CAP {
         let mut progressed = false;
 
@@ -265,7 +306,7 @@ fn client_vs_rustls_server(shin_suite: CipherSuite, rustls_suite: SupportedCiphe
         ServerConnection::new(rustls_server_config(&pki, rustls_suite)).expect("server conn");
     let mut client = dope_client(&pki, shin_suite);
 
-    pump(&mut client, &mut server);
+    pump_client(&mut client, &mut server);
 
     assert!(
         client.is_established(),
@@ -288,7 +329,7 @@ fn client_vs_rustls_server(shin_suite: CipherSuite, rustls_suite: SupportedCiphe
     let req = b"dope-tls client -> rustls server";
     let n = client.write_app(req).expect("client write_app");
     assert_eq!(n, req.len());
-    pump(&mut client, &mut server);
+    pump_client(&mut client, &mut server);
     let mut got = vec![0u8; req.len()];
     use std::io::Read;
     server
@@ -300,21 +341,21 @@ fn client_vs_rustls_server(shin_suite: CipherSuite, rustls_suite: SupportedCiphe
     let reply = b"rustls server -> dope-tls client";
     use std::io::Write;
     server.writer().write_all(reply).expect("server write app");
-    pump(&mut client, &mut server);
+    pump_client(&mut client, &mut server);
     let echoed = drain_app(&mut client, reply.len());
     assert_eq!(echoed.as_slice(), reply, "server->client round-trip");
 
     client
 }
 
-fn server_vs_rustls_client(rustls_suite: SupportedCipherSuite) -> State {
+fn server_vs_rustls_client(rustls_suite: SupportedCipherSuite) -> TestServer {
     let pki = make_pki();
     let name = ServerName::try_from(HOSTNAME).expect("server name");
     let mut client =
         ClientConnection::new(rustls_client_config(&pki, rustls_suite), name).expect("client conn");
     let mut server = dope_server(&pki);
 
-    pump(&mut server, &mut client);
+    pump_server(&mut server, &mut client);
 
     assert!(
         server.is_established(),
@@ -337,14 +378,14 @@ fn server_vs_rustls_client(rustls_suite: SupportedCipherSuite) -> State {
     let req = b"rustls client -> dope-tls server";
     use std::io::Write;
     client.writer().write_all(req).expect("client write app");
-    pump(&mut server, &mut client);
+    pump_server(&mut server, &mut client);
     let got = drain_app(&mut server, req.len());
     assert_eq!(got.as_slice(), req, "client->server round-trip");
 
     let reply = b"dope-tls server -> rustls client";
     let n = server.write_app(reply).expect("server write_app");
     assert_eq!(n, reply.len());
-    pump(&mut server, &mut client);
+    pump_server(&mut server, &mut client);
     let mut echoed = vec![0u8; reply.len()];
     use std::io::Read;
     client

@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use dope_net::wire::buffered::{Buffer, Scratch};
 use dope_net::{Bytes, Leased};
 use shin::alert::{Alert, AlertDescription, AlertParseError};
@@ -77,50 +75,23 @@ impl State {
         Self::new_client_with(config, clock, move |c| c.set_client_cert(cert))
     }
 
-    pub fn new_server(config: server::Config) -> Result<Self, Error> {
+    pub fn new_server(config: server::ConnectionConfig) -> Result<Self, Error> {
         Self::new_server_with_clock(config, WallClock::System)
     }
 
-    pub fn new_server_with_clock(config: server::Config, clock: WallClock) -> Result<Self, Error> {
+    pub fn new_server_with_clock(
+        config: server::ConnectionConfig,
+        clock: WallClock,
+    ) -> Result<Self, Error> {
         Self::new_server_with_buffers(config, clock, Buffers::standalone()?)
     }
 
     pub(crate) fn new_server_with_buffers(
-        config: server::Config,
+        config: server::ConnectionConfig,
         clock: WallClock,
         buffers: Buffers,
     ) -> Result<Self, Error> {
         Ok(Self::empty(Side::server(config, clock)?, buffers))
-    }
-
-    pub fn new_server_mutual(
-        config: server::Config,
-        auth: server::ClientAuth,
-        verifier: Rc<dyn server::ClientCertVerifier>,
-    ) -> Result<Self, Error> {
-        Self::new_server_mutual_with_clock(config, WallClock::System, auth, verifier)
-    }
-
-    pub fn new_server_mutual_with_clock(
-        config: server::Config,
-        clock: WallClock,
-        auth: server::ClientAuth,
-        verifier: Rc<dyn server::ClientCertVerifier>,
-    ) -> Result<Self, Error> {
-        Self::new_server_mutual_with_buffers(config, clock, auth, verifier, Buffers::standalone()?)
-    }
-
-    pub(crate) fn new_server_mutual_with_buffers(
-        config: server::Config,
-        clock: WallClock,
-        auth: server::ClientAuth,
-        verifier: Rc<dyn server::ClientCertVerifier>,
-        buffers: Buffers,
-    ) -> Result<Self, Error> {
-        Ok(Self::empty(
-            Side::server_mutual(config, clock, auth, verifier)?,
-            buffers,
-        ))
     }
 
     fn seal_app(&mut self, ct: ContentType, data: &[u8]) -> Result<(), Error> {
@@ -143,12 +114,36 @@ impl State {
         }
     }
 
-    pub fn read_tcp(&mut self, bytes: &[u8]) -> Result<(), Error> {
+    pub fn read_client_tcp(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.read_tcp_with(bytes, &mut |side, epoch, data| {
+            side.read_client(epoch, data)
+        })
+    }
+
+    pub fn read_server_tcp<G, V>(
+        &mut self,
+        bytes: &[u8],
+        shard: &mut server::Shard<G, V>,
+    ) -> Result<(), Error>
+    where
+        G: server::EarlyDataGuard,
+        V: server::ClientCertVerifier,
+    {
+        self.read_tcp_with(bytes, &mut |side, epoch, data| {
+            side.read_server(epoch, data, shard)
+        })
+    }
+
+    fn read_tcp_with(
+        &mut self,
+        bytes: &[u8],
+        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    ) -> Result<(), Error> {
         let mut rest = bytes;
         loop {
             let take = self.buffers.append_recv(rest)?;
             rest = &rest[take..];
-            while self.consume_one_record()? {}
+            while self.consume_one_record(read)? {}
             if rest.is_empty() {
                 return Ok(());
             }
@@ -158,8 +153,20 @@ impl State {
         }
     }
 
-    pub fn try_read_tcp(&mut self, bytes: &[u8]) -> bool {
-        bytes.is_empty() || self.read_tcp(bytes).is_ok()
+    pub fn try_read_client_tcp(&mut self, bytes: &[u8]) -> bool {
+        bytes.is_empty() || self.read_client_tcp(bytes).is_ok()
+    }
+
+    pub fn try_read_server_tcp<G, V>(
+        &mut self,
+        bytes: &[u8],
+        shard: &mut server::Shard<G, V>,
+    ) -> bool
+    where
+        G: server::EarlyDataGuard,
+        V: server::ClientCertVerifier,
+    {
+        bytes.is_empty() || self.read_server_tcp(bytes, shard).is_ok()
     }
 
     pub fn pending_send_slice(&self) -> &[u8] {
@@ -278,7 +285,10 @@ impl State {
         self.side.selected_alpn()
     }
 
-    fn consume_one_record(&mut self) -> Result<bool, Error> {
+    fn consume_one_record(
+        &mut self,
+        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    ) -> Result<bool, Error> {
         if self.is_closed() {
             return Ok(false);
         }
@@ -299,8 +309,8 @@ impl State {
         match outer {
             REC_CCS => self.handle_ccs(total),
             REC_ALERT => self.handle_alert(total),
-            REC_HS_PLAIN => self.handle_handshake_plaintext(total),
-            REC_AEAD => self.handle_aead(total),
+            REC_HS_PLAIN => self.handle_handshake_plaintext(total, read),
+            REC_AEAD => self.handle_aead(total, read),
             _ => Err(Error::UnexpectedRecord),
         }
     }
@@ -344,7 +354,11 @@ impl State {
         }
     }
 
-    fn handle_handshake_plaintext(&mut self, total: usize) -> Result<bool, Error> {
+    fn handle_handshake_plaintext(
+        &mut self,
+        total: usize,
+        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    ) -> Result<bool, Error> {
         if total > HEADER_LEN + MAX_PLAINTEXT_BODY {
             return Err(Error::Record(RecordError::BodyTooLarge));
         }
@@ -352,14 +366,18 @@ impl State {
             let view = self.buffers.recv();
             let (rec, consumed) =
                 PlaintextRecord::parse(&view[..total])?.ok_or(Error::UnexpectedRecord)?;
-            (self.side.read(Epoch::Plaintext, rec.body), consumed)
+            (read(&mut self.side, Epoch::Plaintext, rec.body), consumed)
         };
         self.buffers.consume_recv(consumed);
         self.finish_read(result)?;
         Ok(true)
     }
 
-    fn handle_aead(&mut self, total: usize) -> Result<bool, Error> {
+    fn handle_aead(
+        &mut self,
+        total: usize,
+        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
+    ) -> Result<bool, Error> {
         let handshake_epoch = if self.is_handshaking() && self.traffic.handshake_ready() {
             Epoch::Handshake
         } else {
@@ -393,7 +411,7 @@ impl State {
                 self.side.note_application_data();
             }
             ContentType::Handshake => {
-                let result = self.side.read(handshake_epoch, &self.buffers.recv()[range]);
+                let result = read(&mut self.side, handshake_epoch, &self.buffers.recv()[range]);
                 self.buffers.consume_recv(consumed);
                 self.finish_read(result)?;
             }

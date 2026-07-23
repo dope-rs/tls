@@ -99,7 +99,9 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u
         }
         match sock.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => client.read_tcp(&buf[..n]).expect("read_tcp handshake"),
+            Ok(n) => client
+                .read_client_tcp(&buf[..n])
+                .expect("read_tcp handshake"),
             Err(_) => {}
         }
     }
@@ -123,7 +125,7 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u
                 break;
             }
             Ok(n) => {
-                if client.read_tcp(&buf[..n]).is_err() {
+                if client.read_client_tcp(&buf[..n]).is_err() {
                     break;
                 }
                 while let Some(chunk) = client.pull_app() {
@@ -159,28 +161,28 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
         egress: Default::default(),
     };
     let hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-    let mut listener = {
+    let endpoint = Endpoint::server(shin::server::Config {
+        source: shin::server::CertSource::RawPublicKey {
+            signing_key: signing,
+        },
+        alpn_protocols: Vec::new(),
+        ticket_keys: None,
+    })
+    .unwrap();
+    let listener = {
         let mut driver = sess.driver_access();
-        Listener::<0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>::open_in(
+        Listener::<0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>::open_in_with_wire(
             ReplyApp {
                 payload: (0..REPLY_LEN as u32).map(|i| (i % 251) as u8).collect(),
                 closes: closes.clone(),
             },
             listener_cfg,
+            endpoint,
             hash,
             &mut driver,
         )
         .expect("open_in")
     };
-    listener.set_config(Endpoint::Server(Box::new(shin::server::Config {
-        source: shin::server::CertSource::RawPublicKey {
-            signing_key: signing,
-        },
-        transport_params: Vec::new(),
-        alpn_protocols: Vec::new(),
-        ticket_keys: None,
-        accept_early_data: false,
-    })));
     let addr = listener.local_addr().expect("local_addr");
     let client = std::thread::spawn(move || {
         let sock = wait_for_addr(addr);

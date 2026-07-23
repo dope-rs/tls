@@ -1,15 +1,19 @@
 use std::{
     io::{self, Error, ErrorKind},
-    rc::Rc,
+    marker::PhantomData,
 };
 
 use dope_net::wire::send::{Plain, Prepared, SendStorage, Storage, Vectored};
 use dope_net::wire::{
-    Reclaim, RuntimeLimits, Wire,
+    OpenReservation, Reclaim, RuntimeLimits, Wire,
     buffered::{Buffer, Buffered, Scratch},
 };
 use dope_net::{Bytes, Leased};
-use shin::{client, record::MAX_PLAINTEXT_BODY, server};
+use shin::{
+    client,
+    record::MAX_PLAINTEXT_BODY,
+    server::{self, ClientCertVerifier, EarlyDataGuard},
+};
 
 use crate::send::{SendProtocol, Sender};
 use crate::staging::{TLS_STAGING_CAP, TLS13_RECORD_OVERHEAD};
@@ -34,50 +38,258 @@ impl ConnectionState {
     }
 }
 
-#[derive(Clone, Default)]
-pub enum Endpoint {
-    #[default]
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait ServerPolicy: sealed::Sealed + 'static {
+    type Shard: 'static;
+
+    fn read_tcp(state: &mut State, shard: &mut Self::Shard, data: &[u8]) -> bool;
+
+    fn replace_ticket_keys(shard: &mut Self::Shard, keys: Option<shin::ticket::TicketKeys>);
+}
+
+pub struct Standard<G = server::NoGuard>(PhantomData<fn() -> G>);
+
+impl<G> sealed::Sealed for Standard<G> {}
+
+impl<G> ServerPolicy for Standard<G>
+where
+    G: EarlyDataGuard + 'static,
+{
+    type Shard = server::Shard<G, server::NoClientAuth>;
+
+    fn read_tcp(state: &mut State, shard: &mut Self::Shard, data: &[u8]) -> bool {
+        state.try_read_server_tcp(data, shard)
+    }
+
+    fn replace_ticket_keys(shard: &mut Self::Shard, keys: Option<shin::ticket::TicketKeys>) {
+        shard.replace_ticket_keys(keys);
+    }
+}
+
+pub struct Mutual<G, V>(PhantomData<fn() -> (G, V)>);
+
+impl<G, V> sealed::Sealed for Mutual<G, V> {}
+
+impl<G, V> ServerPolicy for Mutual<G, V>
+where
+    G: EarlyDataGuard + 'static,
+    V: ClientCertVerifier + 'static,
+{
+    type Shard = server::Shard<G, V>;
+
+    fn read_tcp(state: &mut State, shard: &mut Self::Shard, data: &[u8]) -> bool {
+        state.try_read_server_tcp(data, shard)
+    }
+
+    fn replace_ticket_keys(shard: &mut Self::Shard, keys: Option<shin::ticket::TicketKeys>) {
+        shard.replace_ticket_keys(keys);
+    }
+}
+
+pub struct ClientSetup {
+    config: client::Config,
+    cert: Option<client::ClientCertSource>,
+}
+
+impl ClientSetup {
+    pub fn new(config: client::Config) -> Self {
+        Self { config, cert: None }
+    }
+
+    pub fn mutual(config: client::Config, cert: client::ClientCertSource) -> Self {
+        Self {
+            config,
+            cert: Some(cert),
+        }
+    }
+}
+
+pub trait ClientSource: 'static {
+    fn next(&mut self) -> Option<ClientSetup>;
+}
+
+impl<F> ClientSource for F
+where
+    F: FnMut() -> Option<ClientSetup> + 'static,
+{
+    fn next(&mut self) -> Option<ClientSetup> {
+        self()
+    }
+}
+
+pub struct NoClients;
+
+impl ClientSource for NoClients {
+    fn next(&mut self) -> Option<ClientSetup> {
+        None
+    }
+}
+
+pub struct OnceClient(Option<ClientSetup>);
+
+impl ClientSource for OnceClient {
+    fn next(&mut self) -> Option<ClientSetup> {
+        self.0.take()
+    }
+}
+
+enum EndpointKind<P: ServerPolicy, S: ClientSource> {
     None,
-    Server(Box<server::Config>),
-    ServerMutual {
-        config: Box<server::Config>,
-        auth: server::ClientAuth,
-        verifier: Rc<dyn server::ClientCertVerifier>,
-    },
-    Client(client::Config),
-    ClientMutual {
-        config: Box<client::Config>,
-        cert: client::ClientCertSource,
-    },
+    Server(P::Shard),
+    Client(S),
+}
+
+pub struct Endpoint<P: ServerPolicy = Standard, S: ClientSource = NoClients>(EndpointKind<P, S>);
+
+impl<P: ServerPolicy, S: ClientSource> Default for Endpoint<P, S> {
+    fn default() -> Self {
+        Self(EndpointKind::None)
+    }
 }
 
 impl Endpoint {
+    pub fn server(config: server::Config) -> Result<Self, crate::error::Error> {
+        config.validate().map_err(crate::error::Error::Handshake)?;
+        Ok(Self(EndpointKind::Server(server::Shard::new(config))))
+    }
+}
+
+impl<G> Endpoint<Standard<G>>
+where
+    G: EarlyDataGuard + 'static,
+{
+    pub fn server_with_early_data_guard(
+        config: server::Config,
+        guard: G,
+    ) -> Result<Self, crate::error::Error> {
+        config.validate().map_err(crate::error::Error::Handshake)?;
+        Ok(Self(EndpointKind::Server(
+            server::Shard::with_early_data_guard(config, guard),
+        )))
+    }
+}
+
+impl<V> Endpoint<Mutual<server::NoGuard, V>>
+where
+    V: ClientCertVerifier + 'static,
+{
     pub fn server_mutual(
         config: server::Config,
         auth: server::ClientAuth,
-        verifier: Rc<dyn server::ClientCertVerifier>,
-    ) -> Self {
-        Self::ServerMutual {
-            config: Box::new(config),
-            auth,
-            verifier,
-        }
+        verifier: V,
+    ) -> Result<Self, crate::error::Error> {
+        config.validate().map_err(crate::error::Error::Handshake)?;
+        Ok(Self(EndpointKind::Server(server::Shard::with_client_auth(
+            config, auth, verifier,
+        ))))
+    }
+}
+
+impl<G, V> Endpoint<Mutual<G, V>>
+where
+    G: EarlyDataGuard + 'static,
+    V: ClientCertVerifier + 'static,
+{
+    pub fn server_mutual_with_early_data_guard(
+        config: server::Config,
+        guard: G,
+        auth: server::ClientAuth,
+        verifier: V,
+    ) -> Result<Self, crate::error::Error> {
+        config.validate().map_err(crate::error::Error::Handshake)?;
+        Ok(Self(EndpointKind::Server(
+            server::Shard::with_early_data_guard_and_client_auth(config, guard, auth, verifier),
+        )))
+    }
+}
+
+impl Endpoint<Standard, OnceClient> {
+    pub fn client(config: client::Config) -> Self {
+        Self(EndpointKind::Client(OnceClient(Some(ClientSetup::new(
+            config,
+        )))))
     }
 
     pub fn client_mutual(config: client::Config, cert: client::ClientCertSource) -> Self {
-        Self::ClientMutual {
-            config: Box::new(config),
-            cert,
+        Self(EndpointKind::Client(OnceClient(Some(ClientSetup::mutual(
+            config, cert,
+        )))))
+    }
+}
+
+impl<P, S> Endpoint<P, S>
+where
+    P: ServerPolicy,
+    S: ClientSource,
+{
+    pub fn client_source(source: S) -> Self {
+        Self(EndpointKind::Client(source))
+    }
+}
+
+enum RuntimeMode<P: ServerPolicy, S: ClientSource> {
+    None,
+    Server(P::Shard),
+    Client(S),
+}
+
+pub struct Runtime<P: ServerPolicy, S: ClientSource> {
+    retry: Option<(Tls<P, S>, SendState)>,
+    buffers: Buffered,
+    mode: RuntimeMode<P, S>,
+}
+
+impl<P, S> Runtime<P, S>
+where
+    P: ServerPolicy,
+    S: ClientSource,
+{
+    pub fn replace_ticket_keys(&mut self, keys: Option<shin::ticket::TicketKeys>) -> bool {
+        let RuntimeMode::Server(shard) = &mut self.mode else {
+            return false;
+        };
+        P::replace_ticket_keys(shard, keys);
+        true
+    }
+}
+
+pub struct Tls<P: ServerPolicy = Standard, S: ClientSource = NoClients> {
+    state: ConnectionState,
+    send_inflight: bool,
+    _mode: PhantomData<fn() -> (P, S)>,
+}
+
+pub struct SendState(pub(crate) Buffer<Scratch>);
+
+pub struct TlsOpen<'a, P: ServerPolicy, S: ClientSource> {
+    runtime: &'a mut Runtime<P, S>,
+    value: Option<(Tls<P, S>, SendState)>,
+}
+
+impl<P, S> Drop for TlsOpen<'_, P, S>
+where
+    P: ServerPolicy,
+    S: ClientSource,
+{
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            assert!(self.runtime.retry.replace(value).is_none());
         }
     }
 }
 
-pub struct Tls {
-    state: ConnectionState,
-    send_inflight: bool,
+impl<P, S> OpenReservation<Tls<P, S>> for TlsOpen<'_, P, S>
+where
+    P: ServerPolicy,
+    S: ClientSource,
+{
+    fn commit(mut self) -> (Tls<P, S>, SendState) {
+        self.value.take().unwrap()
+    }
 }
-
-pub struct SendState(pub(crate) Buffer<Scratch>);
 
 unsafe impl SendStorage for SendState {
     fn as_slice(&self) -> &[u8] {
@@ -85,7 +297,11 @@ unsafe impl SendStorage for SendState {
     }
 }
 
-impl Tls {
+impl<P, S> Tls<P, S>
+where
+    P: ServerPolicy,
+    S: ClientSource,
+{
     pub(crate) fn runtime_buffers(
         limits: RuntimeLimits,
         scratch_per_connection: usize,
@@ -99,14 +315,54 @@ impl Tls {
         .map_err(|error| Error::new(ErrorKind::InvalidInput, error))
     }
 
-    fn ingress_decrypt(&mut self, wire_in: &[u8]) {
+    fn open(runtime: &mut Runtime<P, S>) -> Option<(Self, SendState)> {
+        let send = SendState(runtime.buffers.try_acquire_scratch()?);
+        let mut state = ConnectionState::empty();
+        let tls = match &mut runtime.mode {
+            RuntimeMode::Server(_) => State::new_server_with_buffers(
+                server::ConnectionConfig {
+                    transport_params: Vec::new(),
+                },
+                WallClock::System,
+                Buffers::try_runtime(&runtime.buffers)?,
+            )
+            .ok(),
+            RuntimeMode::Client(source) => {
+                let ClientSetup { config, cert } = source.next()?;
+                State::new_client_with_buffers(
+                    config,
+                    WallClock::System,
+                    move |client| {
+                        if let Some(cert) = cert {
+                            client.set_client_cert(cert);
+                        }
+                    },
+                    Buffers::try_runtime(&runtime.buffers)?,
+                )
+                .ok()
+            }
+            RuntimeMode::None => None,
+        };
+        state.close = tls.is_none();
+        state.tls = tls;
+        Some((
+            Self {
+                state,
+                send_inflight: false,
+                _mode: PhantomData,
+            },
+            send,
+        ))
+    }
+
+    fn ingress_decrypt(&mut self, wire_in: &[u8], read: impl FnOnce(&mut State, &[u8]) -> bool) {
         match self.state.tls.as_mut() {
             None => {
                 let _ = wire_in;
                 self.state.close = true;
             }
             Some(tls) => {
-                if !tls.try_read_tcp(wire_in) {
+                if !read(tls, wire_in) {
                     self.state.close = true;
                     return;
                 }
@@ -213,7 +469,11 @@ impl Tls {
     }
 }
 
-impl SendProtocol for Tls {
+impl<P, S> SendProtocol for Tls<P, S>
+where
+    P: ServerPolicy,
+    S: ClientSource,
+{
     fn encrypt(&mut self, egress: &mut Buffer<Scratch>, plain: &[u8]) -> usize {
         self.encrypt(egress, plain)
     }
@@ -231,9 +491,14 @@ impl SendProtocol for Tls {
     }
 }
 
-impl Wire for Tls {
-    type InitConfig = Endpoint;
-    type RuntimeContext = Buffered;
+impl<P, S> Wire for Tls<P, S>
+where
+    P: ServerPolicy,
+    S: ClientSource,
+{
+    type InitConfig = Endpoint<P, S>;
+    type RuntimeContext = Runtime<P, S>;
+    type Open<'a> = TlsOpen<'a, P, S>;
     type Recv<'a> = Bytes<Leased>;
     type SendStorage = SendState;
 
@@ -243,61 +508,48 @@ impl Wire for Tls {
         !send.0.as_slice().is_empty()
     }
 
-    fn runtime_context(limits: RuntimeLimits) -> io::Result<Buffered> {
-        Self::runtime_buffers(limits, 3)
-    }
-
-    fn open(cfg: &Endpoint, runtime: &Buffered) -> Option<(Self, SendState)> {
-        let send = SendState(runtime.try_acquire_scratch()?);
-        let mut s = ConnectionState::empty();
-        let tls = match cfg {
-            Endpoint::Server(c) => State::new_server_with_buffers(
-                (**c).clone(),
-                WallClock::System,
-                Buffers::try_runtime(runtime)?,
-            )
-            .ok(),
-            Endpoint::ServerMutual {
-                config,
-                auth,
-                verifier,
-            } => State::new_server_mutual_with_buffers(
-                (**config).clone(),
-                WallClock::System,
-                *auth,
-                verifier.clone(),
-                Buffers::try_runtime(runtime)?,
-            )
-            .ok(),
-            Endpoint::Client(c) => State::new_client_with_buffers(
-                c.clone(),
-                WallClock::System,
-                |_| {},
-                Buffers::try_runtime(runtime)?,
-            )
-            .ok(),
-            Endpoint::ClientMutual { config, cert } => State::new_client_with_buffers(
-                (**config).clone(),
-                WallClock::System,
-                |client| client.set_client_cert(cert.clone()),
-                Buffers::try_runtime(runtime)?,
-            )
-            .ok(),
-            Endpoint::None => None,
-        };
-        s.close = tls.is_none();
-        s.tls = tls;
-        Some((
-            Self {
-                state: s,
-                send_inflight: false,
+    fn runtime_context(
+        limits: RuntimeLimits,
+        config: Self::InitConfig,
+    ) -> io::Result<Self::RuntimeContext> {
+        Ok(Runtime {
+            retry: None,
+            buffers: Self::runtime_buffers(limits, 3)?,
+            mode: match config.0 {
+                EndpointKind::None => RuntimeMode::None,
+                EndpointKind::Server(shard) => RuntimeMode::Server(shard),
+                EndpointKind::Client(source) => RuntimeMode::Client(source),
             },
-            send,
-        ))
+        })
     }
 
-    fn process_recv<'a>(&mut self, _runtime: &Buffered, bytes: &'a [u8]) -> Option<Self::Recv<'a>> {
-        self.ingress_decrypt(bytes);
+    fn prepare_open(runtime: &mut Self::RuntimeContext) -> Option<Self::Open<'_>> {
+        let value = match runtime.retry.take() {
+            Some(value) => value,
+            None => Self::open(runtime)?,
+        };
+        Some(TlsOpen {
+            runtime,
+            value: Some(value),
+        })
+    }
+
+    fn process_recv<'a>(
+        &mut self,
+        runtime: &mut Self::RuntimeContext,
+        bytes: &'a [u8],
+    ) -> Option<Self::Recv<'a>> {
+        match &mut runtime.mode {
+            RuntimeMode::Server(shard) => {
+                self.ingress_decrypt(bytes, |state, data| P::read_tcp(state, shard, data));
+            }
+            RuntimeMode::Client(_) => {
+                self.ingress_decrypt(bytes, State::try_read_client_tcp);
+            }
+            RuntimeMode::None => {
+                self.state.close = true;
+            }
+        }
         self.state.tls.as_mut()?.pull_leased_app()
     }
 
