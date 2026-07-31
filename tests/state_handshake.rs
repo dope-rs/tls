@@ -1,12 +1,45 @@
 mod common;
 
-use common::{established_pair, pump, raw_pair, signing_key};
-use dope_tls::{error::Error, tls::Endpoint};
+use common::{
+    ClientState, ServerState, TestServer, established_pair, pump, raw_client, raw_pair, signing_key,
+};
+use dope_net::wire::buffered::Buffered;
+use dope_tls::{clock::WallClock, error::Error, tls::Endpoint};
+use shin::wire::record::{HEADER_LEN, MAX_CIPHERTEXT_BODY};
+
+fn pooled_established_pair() -> (ClientState, TestServer) {
+    let runtime = Buffered::try_fixed(4, HEADER_LEN + MAX_CIPHERTEXT_BODY, 1, MAX_CIPHERTEXT_BODY)
+        .expect("runtime buffers");
+    let signing = signing_key();
+    let server_pubkey = *signing.pubkey().expect("server public key");
+    let server_state = ServerState::with_runtime(
+        shin::server::config::ConnectionConfig {
+            transport_params: Vec::new(),
+        },
+        WallClock::System,
+        &runtime,
+    )
+    .expect("pooled server");
+    let mut client = raw_client(server_pubkey);
+    let mut server = TestServer::new(
+        server_state,
+        shin::server::Shard::new(shin::server::config::Config {
+            source: shin::server::config::CertSource::RawPublicKey {
+                signing_key: signing,
+            },
+            alpn_protocols: Vec::new(),
+            ticket_keys: None,
+        }),
+    );
+    pump(&mut client, &mut server);
+    assert!(client.is_established() && server.is_established());
+    (client, server)
+}
 
 #[test]
 fn invalid_server_config_is_rejected_before_handshake() {
-    let error = Endpoint::server(shin::server::Config {
-        source: shin::server::CertSource::RawPublicKey {
+    let error = Endpoint::server(shin::server::config::Config {
+        source: shin::server::config::CertSource::RawPublicKey {
             signing_key: signing_key(),
         },
         alpn_protocols: vec![Vec::new()],
@@ -14,7 +47,7 @@ fn invalid_server_config_is_rejected_before_handshake() {
     })
     .err()
     .expect("invalid server configuration");
-    assert_eq!(error, Error::Handshake(shin::Error::BadConfig));
+    assert_eq!(error, Error::Handshake(shin::connection::Error::BadConfig));
 }
 
 #[test]
@@ -137,7 +170,7 @@ fn fragmented_tcp_input_is_buffered_correctly() {
 
     let s_bytes = server.pull_send();
     for chunk in s_bytes.chunks(7) {
-        client.read_client_tcp(chunk).unwrap();
+        client.read_tcp(chunk).unwrap();
     }
 
     let cf_bytes = client.pull_send();
@@ -147,6 +180,129 @@ fn fragmented_tcp_input_is_buffered_correctly() {
 
     assert!(client.is_established());
     assert!(server.is_established());
+}
+
+#[test]
+fn complete_records_are_returned_as_input_ranges() {
+    let (mut client, mut server) = established_pair();
+    let expected = [
+        b"first".as_slice(),
+        b"second".as_slice(),
+        b"third".as_slice(),
+    ];
+    for plaintext in expected {
+        assert_eq!(client.write_app(plaintext).expect("seal"), plaintext.len());
+    }
+    let mut wire = client.pull_send();
+    let base = wire.as_ptr().addr();
+    let end = base + wire.len();
+
+    let (chunks, ok) = server.read_tcp_in_place(&mut wire);
+    assert!(ok);
+    assert_eq!(chunks.len(), expected.len());
+    for (chunk, expected) in chunks.zip(expected) {
+        let start = chunk.as_ptr().addr();
+        assert!(
+            start >= base && start + chunk.len() <= end,
+            "plaintext must alias the provided ciphertext buffer"
+        );
+        assert_eq!(chunk, expected);
+    }
+    assert!(server.pull_app().is_none());
+}
+
+#[test]
+fn fragmented_record_returns_the_decrypted_staging_range() {
+    let (mut client, mut server) = pooled_established_pair();
+
+    let expected = vec![0x5a; 12_000];
+    assert_eq!(client.write_app(&expected).expect("seal"), expected.len());
+    let mut wire = client.pull_send();
+    let split = 7;
+
+    let (chunks, ok) = server.read_tcp_in_place(&mut wire[..split]);
+    assert!(ok);
+    assert_eq!(chunks.len(), 0);
+    let staged = server.staged_recv().as_ptr().addr();
+
+    let (consumed, chunk, keep_reading, ok) = server.read_staged_wire(&wire[split..]);
+    assert!(ok && keep_reading);
+    assert_eq!(consumed, wire.len() - split);
+    let chunk = chunk.expect("fragmented application record");
+    assert_eq!(
+        chunk.as_slice().as_ptr().addr(),
+        staged + HEADER_LEN,
+        "plaintext must remain in the staging lease"
+    );
+    assert_eq!(chunk.as_slice(), expected);
+    assert!(
+        !server.has_staged_recv(),
+        "replacement staging must be empty"
+    );
+}
+
+#[test]
+fn every_application_record_split_uses_the_same_record_semantics() {
+    let (mut client, mut server) = pooled_established_pair();
+    let expected = [0x5a; 96];
+    assert_eq!(client.write_app(&expected).expect("seal"), expected.len());
+    let mut wire = client.pull_send();
+    let record_len = wire.len();
+
+    for split in 1..record_len {
+        if split != 1 {
+            assert_eq!(client.write_app(&expected).expect("seal"), expected.len());
+            wire = client.pull_send();
+            assert_eq!(wire.len(), record_len);
+        }
+        {
+            let (chunks, ok) = server.read_tcp_in_place(&mut wire[..split]);
+            assert!(ok, "direct prefix failed at split {split}");
+            assert_eq!(
+                chunks.len(),
+                0,
+                "incomplete record escaped at split {split}"
+            );
+        }
+        let (consumed, chunk, keep_reading, ok) = server.read_staged_wire(&wire[split..]);
+        assert!(ok && keep_reading, "staged suffix failed at split {split}");
+        assert_eq!(consumed, record_len - split);
+        assert_eq!(
+            chunk.expect("application chunk").as_slice(),
+            expected,
+            "plaintext changed at split {split}"
+        );
+        assert!(
+            !server.has_staged_recv(),
+            "staging was not replaced at split {split}"
+        );
+    }
+}
+
+#[test]
+fn malformed_control_record_has_identical_fragmented_state() {
+    let server_pubkey = *signing_key().pubkey().expect("server public key");
+    let mut direct = raw_client(server_pubkey);
+    let mut staged = raw_client(server_pubkey);
+    let _ = direct.pull_send();
+    let _ = staged.pull_send();
+    let record = [21u8, 0x03, 0x03, 0x00, 0x01, 0x01];
+
+    let mut direct_record = record;
+    let (_, direct_ok) = direct.read_tcp_in_place(&mut direct_record);
+    assert!(!direct_ok);
+
+    let mut staged_record = record;
+    let (_, prefix_ok) = staged.read_tcp_in_place(&mut staged_record[..3]);
+    assert!(prefix_ok);
+    let (consumed, chunk, keep_reading, staged_ok) = staged.read_staged_wire(&staged_record[3..]);
+    assert_eq!(consumed, record.len() - 3);
+    assert!(chunk.is_none());
+    assert!(!keep_reading && !staged_ok);
+
+    assert_eq!(direct.phase(), staged.phase());
+    assert_eq!(direct.peer_close(), staged.peer_close());
+    assert!(direct.is_closed() && staged.is_closed());
 }
 
 #[test]

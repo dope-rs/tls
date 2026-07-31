@@ -1,6 +1,7 @@
 use std::{error, fmt, io};
 
-use shin::{
+use shin::connection;
+use shin::wire::{
     alert::AlertDescription,
     record::{RecordError, RecordKeyError},
 };
@@ -8,7 +9,7 @@ use shin::{
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    Handshake(shin::Error),
+    Handshake(connection::Error),
     Record(RecordError),
     RecordKey(RecordKeyError),
     UnexpectedRecord,
@@ -20,6 +21,7 @@ pub enum Error {
     ReceiveOverflow,
     SendOverflow,
     BufferUnavailable,
+    InvalidBufferProgress,
     EarlyDataUnsupported,
 }
 
@@ -49,6 +51,7 @@ impl PartialEq for Error {
             | (Self::ReceiveOverflow, Self::ReceiveOverflow)
             | (Self::SendOverflow, Self::SendOverflow)
             | (Self::BufferUnavailable, Self::BufferUnavailable)
+            | (Self::InvalidBufferProgress, Self::InvalidBufferProgress)
             | (Self::EarlyDataUnsupported, Self::EarlyDataUnsupported)
             | (Self::MalformedAlert, Self::MalformedAlert)
             | (Self::Truncated, Self::Truncated) => true,
@@ -77,6 +80,7 @@ impl fmt::Display for Error {
             Self::ReceiveOverflow => formatter.write_str("TLS receive buffer overflow"),
             Self::SendOverflow => formatter.write_str("TLS send buffer overflow"),
             Self::BufferUnavailable => formatter.write_str("TLS buffer unavailable"),
+            Self::InvalidBufferProgress => formatter.write_str("invalid TLS buffer progress"),
             Self::EarlyDataUnsupported => formatter.write_str("TLS early data is unsupported"),
         }
     }

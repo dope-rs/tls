@@ -1,190 +1,302 @@
-use dope_net::wire::buffered::{Buffer, Scratch};
-use dope_net::{Bytes, Leased};
-use shin::alert::{Alert, AlertDescription, AlertParseError};
-use shin::record::{
-    ContentType, HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY, PlaintextRecord, RecordError,
-};
-use shin::{Epoch, Event, client, server};
+use dope_net::wire::buffered::{Buffer, Buffered, Scratch};
+use dope_net::{Bytes, Retained};
+use shin::client;
+use shin::client::config::{ClientCertSource, Config};
+use shin::server;
+use shin::server::config::{ClientCertVerifier, ConnectionConfig, EarlyDataGuard};
+use shin::wire::alert::{Alert, AlertDescription};
+use shin::wire::record::ContentType;
 
 use buffer::Buffers;
-use side::Side;
+use direct::{Direct, PlainChunks};
+use record::RecordState;
+use sessions::{
+    Client, ClientSession, Pool, PooledClient, PooledServer, Server, ServerSession, Session,
+};
+use staged::Staged;
 use status::{PeerClose, Phase};
-use traffic::Traffic;
 
 use crate::{clock::WallClock, error::Error};
 
 pub(crate) mod buffer;
-mod side;
+#[doc(hidden)]
+pub mod direct;
+mod record;
+pub mod sessions;
+mod staged;
 pub mod status;
 mod traffic;
 
-const REC_CCS: u8 = 20;
-const REC_ALERT: u8 = 21;
-const REC_HS_PLAIN: u8 = 22;
-const REC_AEAD: u8 = 23;
-
-pub struct State {
-    side: Side,
+pub struct State<S: Session> {
+    record: RecordState<S>,
     phase: Phase,
-    traffic: Traffic,
     buffers: Buffers,
     peer_close: PeerClose,
 }
 
-impl State {
-    pub fn new_client(config: client::Config) -> Result<Self, Error> {
-        Self::new_client_with_clock(config, WallClock::System)
+impl State<Client> {
+    pub fn new(config: Config) -> Result<Self, Error> {
+        Self::with_clock(config, WallClock::System)
     }
 
-    pub fn new_client_with_clock(config: client::Config, clock: WallClock) -> Result<Self, Error> {
-        Self::new_client_with(config, clock, |_| {})
+    pub fn with_clock(config: Config, clock: WallClock) -> Result<Self, Error> {
+        Self::with(config, clock, |_| {})
     }
 
-    pub fn new_client_with(
-        config: client::Config,
+    pub fn with(
+        config: Config,
         clock: WallClock,
         configure: impl FnOnce(&mut client::Client<WallClock>),
     ) -> Result<Self, Error> {
-        Self::new_client_with_buffers(config, clock, configure, Buffers::standalone()?)
+        Self::with_buffers(config, clock, configure, Buffers::standalone()?)
     }
 
-    pub(crate) fn new_client_with_buffers(
-        config: client::Config,
+    pub fn mutual(config: Config, cert: ClientCertSource) -> Result<Self, Error> {
+        Self::mutual_with_clock(config, WallClock::System, cert)
+    }
+
+    pub fn mutual_with_clock(
+        config: Config,
+        clock: WallClock,
+        cert: ClientCertSource,
+    ) -> Result<Self, Error> {
+        Self::with(config, clock, move |client| client.set_client_cert(cert))
+    }
+
+    pub(crate) fn with_buffers(
+        config: Config,
         clock: WallClock,
         configure: impl FnOnce(&mut client::Client<WallClock>),
         buffers: Buffers,
     ) -> Result<Self, Error> {
-        let (side, events) = Side::client(config, clock, configure)?;
-        let mut state = Self::empty(side, buffers);
-        state.absorb_events(events)?;
+        Self::start(Client::new(config, clock, configure)?, buffers)
+    }
+}
+
+impl<'d> State<PooledClient<'d>> {
+    pub(crate) fn with_pool(
+        config: Config,
+        clock: WallClock,
+        configure: impl FnOnce(&mut client::Client<WallClock>),
+        buffers: Buffers,
+        sessions: &'d Pool<client::Client<WallClock>>,
+    ) -> Result<Self, Error> {
+        Self::start(
+            PooledClient::new_in(sessions, config, clock, configure)?,
+            buffers,
+        )
+    }
+}
+
+macro_rules! impl_client_state {
+    ([$($generics:tt)*] $session:ty) => {
+impl $($generics)* State<$session> {
+    fn start(session: $session, buffers: Buffers) -> Result<Self, Error> {
+        let mut state = Self::empty(session, buffers);
+        state
+            .record
+            .start_client(&mut state.phase, state.buffers.pending_output())?;
         Ok(state)
     }
 
-    pub fn new_client_mutual(
-        config: client::Config,
-        cert: client::ClientCertSource,
-    ) -> Result<Self, Error> {
-        Self::new_client_mutual_with_clock(config, WallClock::System, cert)
+    pub fn read_tcp(&mut self, bytes: &[u8], mut receive: impl FnMut(&[u8])) -> Result<(), Error> {
+        Staged::new(self).read(
+            bytes,
+            &mut |session, epoch, data, events| session.read_into(epoch, data, events),
+            &mut receive,
+        )
     }
 
-    pub fn new_client_mutual_with_clock(
-        config: client::Config,
+    #[doc(hidden)]
+    pub fn read_tcp_in_place<'a>(&mut self, bytes: &'a mut [u8]) -> (PlainChunks<'a>, bool) {
+        Direct::new(self).read_in_place(bytes, &mut |session, epoch, data, events| {
+            session.read_into(epoch, data, events)
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn read_staged_wire(
+        &mut self,
+        bytes: &[u8],
+    ) -> (usize, Option<Bytes<Retained>>, bool, bool) {
+        let read = Staged::new(self).read_one_wire(bytes, &mut |session, epoch, data, events| {
+            session.read_into(epoch, data, events)
+        });
+        (read.consumed, read.chunk, read.keep_reading, read.ok)
+    }
+
+    pub fn try_read_tcp(&mut self, bytes: &[u8], receive: impl FnMut(&[u8])) -> bool {
+        bytes.is_empty() || self.read_tcp(bytes, receive).is_ok()
+    }
+}
+    };
+}
+
+impl_client_state!([] Client);
+impl_client_state!([<'d>] PooledClient<'d>);
+
+impl State<Server> {
+    pub fn new(config: ConnectionConfig) -> Result<Self, Error> {
+        Self::with_clock(config, WallClock::System)
+    }
+
+    pub fn with_clock(config: ConnectionConfig, clock: WallClock) -> Result<Self, Error> {
+        Self::with_buffers(config, clock, Buffers::standalone()?)
+    }
+
+    #[doc(hidden)]
+    pub fn with_runtime(
+        config: ConnectionConfig,
         clock: WallClock,
-        cert: client::ClientCertSource,
+        runtime: &Buffered,
     ) -> Result<Self, Error> {
-        Self::new_client_with(config, clock, move |c| c.set_client_cert(cert))
+        let buffers = Buffers::from_runtime(runtime);
+        Self::with_buffers(config, clock, buffers)
     }
 
-    pub fn new_server(config: server::ConnectionConfig) -> Result<Self, Error> {
-        Self::new_server_with_clock(config, WallClock::System)
-    }
-
-    pub fn new_server_with_clock(
-        config: server::ConnectionConfig,
-        clock: WallClock,
-    ) -> Result<Self, Error> {
-        Self::new_server_with_buffers(config, clock, Buffers::standalone()?)
-    }
-
-    pub(crate) fn new_server_with_buffers(
-        config: server::ConnectionConfig,
+    pub(crate) fn with_buffers(
+        config: ConnectionConfig,
         clock: WallClock,
         buffers: Buffers,
     ) -> Result<Self, Error> {
-        Ok(Self::empty(Side::server(config, clock)?, buffers))
+        Ok(Self::empty(Server::new(config, clock)?, buffers))
+    }
+}
+
+impl<'d> State<PooledServer<'d>> {
+    pub(crate) fn with_pool(
+        config: ConnectionConfig,
+        clock: WallClock,
+        buffers: Buffers,
+        sessions: &'d Pool<server::Server<WallClock>>,
+    ) -> Result<Self, Error> {
+        Ok(Self::empty(
+            PooledServer::new_in(sessions, config, clock)?,
+            buffers,
+        ))
+    }
+}
+
+macro_rules! impl_server_state {
+    ([$($generics:tt)*] $session:ty) => {
+impl $($generics)* State<$session> {
+    pub fn read_tcp<G, V>(
+        &mut self,
+        bytes: &[u8],
+        shard: &mut server::Shard<G, V>,
+        mut receive: impl FnMut(&[u8]),
+    ) -> Result<(), Error>
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+    {
+        Staged::new(self).read(
+            bytes,
+            &mut |session, epoch, data, events| session.read_into(epoch, data, shard, events),
+            &mut receive,
+        )
     }
 
-    fn seal_app(&mut self, ct: ContentType, data: &[u8]) -> Result<(), Error> {
-        self.traffic
-            .seal_application(self.buffers.pending_mut(), ct, data)
+    #[doc(hidden)]
+    pub fn read_tcp_in_place<'a, G, V>(
+        &mut self,
+        bytes: &'a mut [u8],
+        shard: &mut server::Shard<G, V>,
+    ) -> (PlainChunks<'a>, bool)
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+    {
+        Direct::new(self).read_in_place(bytes, &mut |session, epoch, data, events| {
+            session.read_into(epoch, data, shard, events)
+        })
     }
 
-    fn seal_handshake(&mut self, data: &[u8]) -> Result<(), Error> {
-        self.traffic
-            .seal_handshake(self.buffers.pending_mut(), data)
+    #[doc(hidden)]
+    pub fn read_staged_wire<G, V>(
+        &mut self,
+        bytes: &[u8],
+        shard: &mut server::Shard<G, V>,
+    ) -> (usize, Option<Bytes<Retained>>, bool, bool)
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+    {
+        let read = Staged::new(self).read_one_wire(bytes, &mut |session, epoch, data, events| {
+            session.read_into(epoch, data, shard, events)
+        });
+        (read.consumed, read.chunk, read.keep_reading, read.ok)
     }
 
-    fn empty(side: Side, buffers: Buffers) -> Self {
+    pub fn try_read_tcp<G, V>(
+        &mut self,
+        bytes: &[u8],
+        shard: &mut server::Shard<G, V>,
+        receive: impl FnMut(&[u8]),
+    ) -> bool
+    where
+        G: EarlyDataGuard,
+        V: ClientCertVerifier,
+    {
+        bytes.is_empty() || self.read_tcp(bytes, shard, receive).is_ok()
+    }
+}
+    };
+}
+
+impl_server_state!([] Server);
+impl_server_state!([<'d>] PooledServer<'d>);
+
+impl<S: Session> State<S> {
+    fn empty(session: S, buffers: Buffers) -> Self {
         Self {
-            side,
+            record: RecordState::new(session),
             phase: Phase::Handshaking,
-            traffic: Traffic::default(),
             buffers,
             peer_close: PeerClose::Open,
         }
     }
 
-    pub fn read_client_tcp(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.read_tcp_with(bytes, &mut |side, epoch, data| {
-            side.read_client(epoch, data)
-        })
+    fn seal_app(&mut self, content_type: ContentType, data: &[u8]) -> Result<(), Error> {
+        let mut pending = self.buffers.pending_output();
+        self.record
+            .traffic
+            .seal_application(
+                pending.try_buffer().ok_or(Error::BufferUnavailable)?,
+                content_type,
+                data,
+            )
+            .map_err(Error::from)
     }
 
-    pub fn read_server_tcp<G, V>(
-        &mut self,
-        bytes: &[u8],
-        shard: &mut server::Shard<G, V>,
-    ) -> Result<(), Error>
-    where
-        G: server::EarlyDataGuard,
-        V: server::ClientCertVerifier,
-    {
-        self.read_tcp_with(bytes, &mut |side, epoch, data| {
-            side.read_server(epoch, data, shard)
-        })
+    #[doc(hidden)]
+    pub fn has_staged_recv(&self) -> bool {
+        !self.buffers.recv().is_empty()
     }
 
-    fn read_tcp_with(
-        &mut self,
-        bytes: &[u8],
-        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
-    ) -> Result<(), Error> {
-        let mut rest = bytes;
-        loop {
-            let take = self.buffers.append_recv(rest)?;
-            rest = &rest[take..];
-            while self.consume_one_record(read)? {}
-            if rest.is_empty() {
-                return Ok(());
-            }
-            if take == 0 {
-                return Err(Error::Record(RecordError::BodyTooLarge));
-            }
-        }
-    }
-
-    pub fn try_read_client_tcp(&mut self, bytes: &[u8]) -> bool {
-        bytes.is_empty() || self.read_client_tcp(bytes).is_ok()
-    }
-
-    pub fn try_read_server_tcp<G, V>(
-        &mut self,
-        bytes: &[u8],
-        shard: &mut server::Shard<G, V>,
-    ) -> bool
-    where
-        G: server::EarlyDataGuard,
-        V: server::ClientCertVerifier,
-    {
-        bytes.is_empty() || self.read_server_tcp(bytes, shard).is_ok()
+    #[doc(hidden)]
+    pub fn staged_recv(&self) -> &[u8] {
+        self.buffers.recv()
     }
 
     pub fn pending_send_slice(&self) -> &[u8] {
         self.buffers.pending()
     }
 
-    pub fn consume_pending_send(&mut self, n: usize) {
-        self.buffers.consume_pending(n);
-    }
-
-    pub fn pull_send(&mut self) -> Vec<u8> {
-        self.buffers.take_pending()
+    pub fn consume_pending_send(&mut self, n: usize) -> Result<(), Error> {
+        self.buffers
+            .try_consume_pending(n)
+            .then_some(())
+            .ok_or(Error::InvalidBufferProgress)
     }
 
     pub fn write_app(&mut self, plaintext: &[u8]) -> Result<usize, Error> {
-        let consumed =
-            self.traffic
-                .write_application(self.phase, self.buffers.pending_mut(), plaintext)?;
+        let mut pending = self.buffers.pending_output();
+        let consumed = self.record.traffic.write_application(
+            self.phase,
+            pending.try_buffer().ok_or(Error::BufferUnavailable)?,
+            plaintext,
+        )?;
         self.maybe_auto_key_update()?;
         Ok(consumed)
     }
@@ -195,16 +307,36 @@ impl State {
         plaintext: &[u8],
     ) -> Result<usize, Error> {
         let consumed = self
+            .record
             .traffic
             .write_application(self.phase, output, plaintext)?;
         self.maybe_auto_key_update()?;
         Ok(consumed)
     }
 
+    pub(crate) fn write_app_parts_into<'a>(
+        &mut self,
+        output: &mut Buffer<Scratch>,
+        plaintext_len: usize,
+        parts: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<usize, Error> {
+        let consumed = self.record.traffic.write_application_parts(
+            self.phase,
+            output,
+            plaintext_len,
+            parts,
+        )?;
+        self.maybe_auto_key_update()?;
+        Ok(consumed)
+    }
+
     fn maybe_auto_key_update(&mut self) -> Result<(), Error> {
-        if self.traffic.needs_key_update()
+        if self.record.traffic.needs_key_update()
             && !self.is_closed()
-            && self.traffic.key_update_fits(self.buffers.pending_spare())
+            && self
+                .record
+                .traffic
+                .key_update_fits(self.buffers.pending_spare())
         {
             self.send_key_update(false)?;
         }
@@ -215,23 +347,26 @@ impl State {
         if !self.is_established() {
             return Err(Error::NotEstablished);
         }
-        let events = self.side.send_key_update(request_update)?;
-        self.absorb_events(events)
+        self.record.send_key_update(
+            &mut self.phase,
+            self.buffers.pending_output(),
+            request_update,
+        )
     }
 
     pub fn send_close_notify(&mut self) -> Result<(), Error> {
         self.seal_closing_alert(Alert::close_notify())
     }
 
-    pub fn send_fatal_alert(&mut self, desc: AlertDescription) -> Result<(), Error> {
-        self.seal_closing_alert(Alert::fatal(desc))
+    pub fn send_fatal_alert(&mut self, description: AlertDescription) -> Result<(), Error> {
+        self.seal_closing_alert(Alert::fatal(description))
     }
 
     fn seal_closing_alert(&mut self, alert: Alert) -> Result<(), Error> {
         if matches!(self.phase, Phase::Closed) {
             return Ok(());
         }
-        if !self.traffic.application_ready() {
+        if !self.record.traffic.application_ready() {
             return Err(Error::NotEstablished);
         }
         self.seal_app(ContentType::Alert, &alert.body())?;
@@ -241,7 +376,7 @@ impl State {
 
     pub fn can_close_notify(&self) -> bool {
         matches!(self.phase, Phase::Established | Phase::PeerClosed)
-            && self.traffic.application_ready()
+            && self.record.traffic.application_ready()
     }
 
     pub fn peer_close(&self) -> PeerClose {
@@ -255,14 +390,6 @@ impl State {
             return Err(Error::Truncated);
         }
         Ok(())
-    }
-
-    pub fn pull_app(&mut self) -> Option<Vec<u8>> {
-        self.buffers.take_vec()
-    }
-
-    pub(crate) fn pull_leased_app(&mut self) -> Option<Bytes<Leased>> {
-        self.buffers.take_leased()
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -282,217 +409,15 @@ impl State {
     }
 
     pub fn selected_alpn(&self) -> Option<&[u8]> {
-        self.side.selected_alpn()
-    }
-
-    fn consume_one_record(
-        &mut self,
-        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
-    ) -> Result<bool, Error> {
-        if self.is_closed() {
-            return Ok(false);
-        }
-        let view = self.buffers.recv();
-        if view.len() < HEADER_LEN {
-            return Ok(false);
-        }
-        let outer = view[0];
-        let body_len = u16::from_be_bytes([view[3], view[4]]) as usize;
-        if body_len > MAX_CIPHERTEXT_BODY {
-            return Err(Error::Record(RecordError::BodyTooLarge));
-        }
-        let total = HEADER_LEN + body_len;
-        if view.len() < total {
-            return Ok(false);
-        }
-
-        match outer {
-            REC_CCS => self.handle_ccs(total),
-            REC_ALERT => self.handle_alert(total),
-            REC_HS_PLAIN => self.handle_handshake_plaintext(total, read),
-            REC_AEAD => self.handle_aead(total, read),
-            _ => Err(Error::UnexpectedRecord),
-        }
-    }
-
-    fn handle_ccs(&mut self, total: usize) -> Result<bool, Error> {
-        self.buffers.consume_recv(total);
-        Ok(true)
-    }
-
-    fn handle_alert(&mut self, total: usize) -> Result<bool, Error> {
-        let parsed = Alert::parse(self.buffers.recv().get(HEADER_LEN..total).unwrap_or(&[]));
-        self.buffers.consume_recv(total);
-        self.classify_alert(parsed, false)
-    }
-
-    fn classify_alert(
-        &mut self,
-        parsed: Result<Alert, AlertParseError>,
-        encrypted: bool,
-    ) -> Result<bool, Error> {
-        let alert = match parsed {
-            Ok(a) => a,
-            Err(_) => {
-                self.phase = Phase::Closed;
-                self.peer_close = PeerClose::Fatal(AlertDescription::DecodeError);
-                return Err(Error::MalformedAlert);
-            }
-        };
-        if encrypted && alert.description == AlertDescription::CloseNotify {
-            self.peer_close = PeerClose::CloseNotify;
-            self.phase = if self.traffic.application_ready() {
-                Phase::PeerClosed
-            } else {
-                Phase::Closed
-            };
-            Ok(false)
-        } else {
-            self.phase = Phase::Closed;
-            self.peer_close = PeerClose::Fatal(alert.description);
-            Err(Error::PeerAlert(alert.description))
-        }
-    }
-
-    fn handle_handshake_plaintext(
-        &mut self,
-        total: usize,
-        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
-    ) -> Result<bool, Error> {
-        if total > HEADER_LEN + MAX_PLAINTEXT_BODY {
-            return Err(Error::Record(RecordError::BodyTooLarge));
-        }
-        let (result, consumed) = {
-            let view = self.buffers.recv();
-            let (rec, consumed) =
-                PlaintextRecord::parse(&view[..total])?.ok_or(Error::UnexpectedRecord)?;
-            (read(&mut self.side, Epoch::Plaintext, rec.body), consumed)
-        };
-        self.buffers.consume_recv(consumed);
-        self.finish_read(result)?;
-        Ok(true)
-    }
-
-    fn handle_aead(
-        &mut self,
-        total: usize,
-        read: &mut impl FnMut(&mut Side, Epoch, &[u8]) -> Result<Vec<Event>, shin::Error>,
-    ) -> Result<bool, Error> {
-        let handshake_epoch = if self.is_handshaking() && self.traffic.handshake_ready() {
-            Epoch::Handshake
-        } else {
-            Epoch::Application
-        };
-        let opened = self
-            .traffic
-            .opener(self.phase)?
-            .open(&mut self.buffers.recv_mut()[..total]);
-        let (inner_type, range, consumed) = match opened {
-            Ok(Some(v)) => v,
-            Ok(None) => return Err(Error::UnexpectedRecord),
-            Err(e) => {
-                let desc = match e {
-                    RecordError::UnexpectedChangeCipherSpec => AlertDescription::UnexpectedMessage,
-                    _ => AlertDescription::BadRecordMac,
-                };
-                self.stage_fatal_alert(desc);
-                self.phase = Phase::Closed;
-                return Err(Error::Record(e));
-            }
-        };
-
-        match inner_type {
-            ContentType::ApplicationData => {
-                if !range.is_empty() && !self.buffers.extend_incoming(range) {
-                    self.buffers.consume_recv(consumed);
-                    return self.fatal_overflow();
-                }
-                self.buffers.consume_recv(consumed);
-                self.side.note_application_data();
-            }
-            ContentType::Handshake => {
-                let result = read(&mut self.side, handshake_epoch, &self.buffers.recv()[range]);
-                self.buffers.consume_recv(consumed);
-                self.finish_read(result)?;
-            }
-            ContentType::Alert => {
-                let parsed = Alert::parse(&self.buffers.recv()[range]);
-                self.buffers.consume_recv(consumed);
-                return self.classify_alert(parsed, true);
-            }
-            ContentType::ChangeCipherSpec => {
-                self.buffers.consume_recv(consumed);
-            }
-        }
-        Ok(true)
+        self.record.side.selected_alpn()
     }
 
     fn fatal_overflow(&mut self) -> Result<bool, Error> {
-        self.stage_fatal_alert(AlertDescription::RecordOverflow);
+        self.record.stage_fatal_alert(
+            &mut self.buffers.pending_output(),
+            AlertDescription::RecordOverflow,
+        );
         self.phase = Phase::Closed;
         Err(Error::ReceiveOverflow)
-    }
-
-    fn stage_fatal_alert(&mut self, desc: AlertDescription) {
-        let alert = Alert::fatal(desc);
-        if self.traffic.application_ready() {
-            let _ = self.seal_app(ContentType::Alert, &alert.body());
-        } else {
-            let _ = self
-                .buffers
-                .encode_plaintext(ContentType::Alert, &alert.body());
-        }
-    }
-
-    fn finish_read(&mut self, result: Result<Vec<Event>, shin::Error>) -> Result<(), Error> {
-        let evs = match result {
-            Ok(evs) => evs,
-            Err(e) => {
-                self.stage_fatal_alert(e.alert().description);
-                self.phase = Phase::Closed;
-                return Err(Error::Handshake(e));
-            }
-        };
-        self.absorb_events(evs)
-    }
-
-    fn absorb_events(&mut self, events: Vec<Event>) -> Result<(), Error> {
-        for e in events {
-            match e {
-                Event::Send { epoch, data } => match epoch {
-                    Epoch::Plaintext => self
-                        .buffers
-                        .encode_plaintext(ContentType::Handshake, &data)?,
-                    Epoch::Handshake => self.seal_handshake(&data)?,
-                    Epoch::Application => self.seal_app(ContentType::Handshake, &data)?,
-                    Epoch::EarlyData => return Err(Error::EarlyDataUnsupported),
-                },
-                Event::KeysReady {
-                    epoch,
-                    read_secret,
-                    write_secret,
-                } => {
-                    self.traffic.install(
-                        epoch,
-                        read_secret.as_slice(),
-                        write_secret.as_slice(),
-                        self.side.cipher_suite(),
-                    )?;
-                }
-                Event::KeyUpdate { direction, secret } => {
-                    self.traffic
-                        .update(direction, secret.as_slice(), self.side.cipher_suite())?;
-                }
-                Event::PeerExtension { .. } => {}
-                Event::NewSessionTicket { .. } | Event::ResumptionSecret { .. } => {}
-                Event::ZeroRttKeysReady { .. }
-                | Event::EarlyDataAccepted
-                | Event::EarlyDataRejected => {}
-                Event::Done => {
-                    self.phase = Phase::Established;
-                }
-            }
-        }
-        Ok(())
     }
 }

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{pump, raw_pair_with_suites};
-use shin::record::CipherSuite;
+use shin::wire::record::CipherSuite;
 
 fn negotiates(suite: CipherSuite) {
     let (mut client, mut server) = raw_pair_with_suites(&[suite]);

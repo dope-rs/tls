@@ -26,19 +26,22 @@ jobs:
 
   clippy:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["--no-default-features", "--all-features"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: ["", "--features rustls"]
+        features: ["--no-default-features", "--all-features"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

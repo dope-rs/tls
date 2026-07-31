@@ -9,5 +9,5 @@ pub mod tls;
 #[cfg(feature = "rustls")]
 pub mod rustls;
 
-pub use shin::client::ClientCertSource;
-pub use shin::server::{ClientAuth, ClientCertVerifier, ClientIdentity};
+pub use shin::client::config::ClientCertSource;
+pub use shin::server::{config::ClientAuth, config::ClientCertVerifier, config::ClientIdentity};

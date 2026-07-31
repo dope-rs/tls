@@ -8,21 +8,27 @@ use std::time::Duration;
 use dope::DriverContext;
 use dope::manifold::Outcome;
 use dope::manifold::env::Bundle;
-use dope::manifold::listener::{self, Application, Listener, SlotEgress};
-use dope::runtime::Executor;
+use dope::manifold::listener::Listener;
+use dope::manifold::listener::application::{Application, ApplicationHooks};
+use dope::manifold::listener::config::Config;
+use dope::manifold::listener::egress::SlotEgress;
+use dope::manifold::listener::state::{EgressCtx, State};
+use dope::runtime::executor::Executor;
 use dope::runtime::profile;
+use dope_net::link::egress::storage::Storage as EgressStorage;
 use dope_net::link::slot::Slot;
 use dope_net::tcp::Tcp;
 use dope_net::{Bytes, RetainBytes};
 use dope_tls::{
-    state::{State, status::PeerClose},
-    tls::{Endpoint, Tls},
+    state::status::PeerClose,
+    tls::{Endpoint, SessionStorage, Tls},
 };
 
 mod common;
 use common::{drive_until, signing_key, wait_for_addr};
 
 const REPLY_LEN: usize = 50_000;
+const REPLY_PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
 
 struct ReplyApp {
     payload: Vec<u8>,
@@ -32,37 +38,32 @@ struct ReplyApp {
 impl<'d> Application<'d> for ReplyApp {
     type Conn = ();
     type Wire = Tls;
+    type Hooks = Self;
+}
 
+impl<'d> ApplicationHooks<'d, ReplyApp> for ReplyApp {
     fn chunk<R: RetainBytes>(
-        self: Pin<&mut Self>,
-        slot: &mut Slot<'d, Self::Wire, listener::State<Self::Conn>>,
+        app: Pin<&mut ReplyApp>,
+        slot: &mut Slot<'d, Tls, State<()>>,
+        mut egress: EgressCtx<'_, '_>,
         _chunk: R,
-        aux: &mut listener::Aux,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
-        let payload = &self.get_mut().payload;
-        let buf = aux.write_buf_for(slot);
+        let payload = &app.get_mut().payload;
+        let mut buf = egress.write_buf_for(slot);
+        buf[..REPLY_PREFIX.len()].copy_from_slice(REPLY_PREFIX);
         let body = Bytes::copy_from_slice(payload).into_shared();
         let ud = slot.token();
-        slot.submit_split_shared(buf, 0, body, ud, driver);
+        slot.submit_split_shared(buf, REPLY_PREFIX.len(), body, ud, driver);
         Outcome::CloseAfter
     }
 
-    fn send(
-        self: Pin<&mut Self>,
-        _slot: &mut Slot<'d, Self::Wire, listener::State<Self::Conn>>,
-        _sent: usize,
-        _aux: &mut listener::Aux,
-        _driver: &mut DriverContext<'_, 'd>,
-    ) {
-    }
-
     fn close(
-        self: Pin<&mut Self>,
-        _slot: &mut Slot<'d, Self::Wire, listener::State<Self::Conn>>,
-        _aux: &mut listener::Aux,
+        app: Pin<&mut ReplyApp>,
+        _slot: &mut Slot<'d, Tls, State<()>>,
+        _egress: EgressCtx<'_, '_>,
     ) {
-        let closes = &self.get_mut().closes;
+        let closes = &app.get_mut().closes;
         closes.set(closes.get() + 1);
     }
 }
@@ -72,12 +73,37 @@ impl<'d> Application<'d> for ReplyApp {
 struct App<'d> {
     #[pin]
     #[manifold]
-    listener: Listener<'d, 0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>,
+    listener: Listener<'d, 'd, 0, ReplyApp, Bundle<Tcp, Tls, profile::Throughput>>,
 }
 
-fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u8>) {
-    let mut client = State::new_client(shin::client::Config {
-        verifier: shin::client::Verifier::RawPublicKey {
+#[derive(Default)]
+struct WireRecords {
+    pending: Vec<u8>,
+    complete: usize,
+}
+
+impl WireRecords {
+    fn push(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        let mut consumed = 0;
+        while self.pending.len() - consumed >= 5 {
+            let body_len =
+                u16::from_be_bytes([self.pending[consumed + 3], self.pending[consumed + 4]])
+                    as usize;
+            let record_len = 5 + body_len;
+            if self.pending.len() - consumed < record_len {
+                break;
+            }
+            consumed += record_len;
+            self.complete += 1;
+        }
+        self.pending.drain(..consumed);
+    }
+}
+
+fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u8>, WireRecords) {
+    let mut client = common::ClientState::new(shin::client::config::Config {
+        verifier: shin::client::config::Verifier::RawPublicKey {
             expected_pubkey: server_pubkey,
         },
         transport_params: Vec::new(),
@@ -99,9 +125,7 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u
         }
         match sock.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => client
-                .read_client_tcp(&buf[..n])
-                .expect("read_tcp handshake"),
+            Ok(n) => client.read_tcp(&buf[..n]).expect("read_tcp handshake"),
             Err(_) => {}
         }
     }
@@ -117,7 +141,8 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u
         sock.write_all(&req).expect("write request");
     }
 
-    let mut received = Vec::with_capacity(REPLY_LEN);
+    let mut received = Vec::with_capacity(REPLY_LEN + REPLY_PREFIX.len());
+    let mut records = WireRecords::default();
     for _ in 0..64 {
         match sock.read(&mut buf) {
             Ok(0) => {
@@ -125,7 +150,8 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u
                 break;
             }
             Ok(n) => {
-                if client.read_client_tcp(&buf[..n]).is_err() {
+                records.push(&buf[..n]);
+                if client.read_tcp(&buf[..n]).is_err() {
                     break;
                 }
                 while let Some(chunk) = client.pull_app() {
@@ -139,20 +165,24 @@ fn run_client(mut sock: TcpStream, server_pubkey: [u8; 32]) -> (PeerClose, Vec<u
             }
         }
     }
-    (client.peer_close(), received)
+    (client.peer_close(), received, records)
 }
 
 #[test]
-fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
+fn vectored_reply_coalesces_records_before_graceful_close() {
     let signing = signing_key();
     let server_pubkey = *signing.pubkey().unwrap();
     let closes = Rc::new(Cell::new(0u32));
 
     let cfg = dope::driver::Config::for_tcp_profile::<profile::Throughput>(16);
-    let exec = Executor::new(cfg).expect("executor");
+    let exec = Executor::new(cfg).expect("executor").with_storage((
+        EgressStorage::default(),
+        SessionStorage::try_with_capacity(16).expect("TLS session storage"),
+    ));
     exec.enter(|mut sess| {
+    let (egress, tls_storage) = sess.storage();
     let bind: SocketAddr = "127.0.0.1:0".parse().expect("bind");
-    let listener_cfg = listener::Config::<Tcp> {
+    let listener_cfg = Config::<Tcp> {
         max_connections: 16,
         bind,
         backlog: 128,
@@ -161,8 +191,8 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
         egress: Default::default(),
     };
     let hash = sess.seed().derive(dope::hash::domain::ACCEPT).state();
-    let endpoint = Endpoint::server(shin::server::Config {
-        source: shin::server::CertSource::RawPublicKey {
+    let endpoint = Endpoint::server(shin::server::config::Config {
+        source: shin::server::config::CertSource::RawPublicKey {
             signing_key: signing,
         },
         alpn_protocols: Vec::new(),
@@ -177,8 +207,9 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
                 closes: closes.clone(),
             },
             listener_cfg,
-            endpoint,
+            endpoint.bind(tls_storage),
             hash,
+            egress,
             &mut driver,
         )
         .expect("open_in")
@@ -194,13 +225,26 @@ fn graceful_close_puts_close_notify_on_the_wire_before_fin() {
         drive_until(&mut app, move || closes_done.get() >= 1);
     });
 
-    let (peer_close, received) = client.join().expect("client join");
+    let (peer_close, received, records) = client.join().expect("client join");
     assert_eq!(
         peer_close,
         PeerClose::CloseNotify,
         "a graceful server close must emit a close_notify before the FIN, not a bare FIN (Truncated)"
     );
-    let expected: Vec<u8> = (0..REPLY_LEN as u32).map(|i| (i % 251) as u8).collect();
+    let mut expected = REPLY_PREFIX.to_vec();
+    expected.extend((0..REPLY_LEN as u32).map(|i| (i % 251) as u8));
+    assert_eq!(
+        records.complete,
+        expected
+            .len()
+            .div_ceil(shin::wire::record::MAX_PLAINTEXT_BODY)
+            + 1,
+        "vectored boundaries must not create extra application records"
+    );
+    assert!(
+        records.pending.is_empty(),
+        "the server must not truncate its last TLS record"
+    );
     assert_eq!(received, expected, "multi-record reply must precede close_notify");
     assert_eq!(closes.get(), 1, "connection must close exactly once");
     });

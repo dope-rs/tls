@@ -1,168 +1,134 @@
 use std::{
     io::{self, ErrorKind},
-    mem,
     ops::Range,
 };
 
-use dope_net::wire::buffered::{Buffer, Buffered, FillError, Recv, RecvPool, Scratch};
-use dope_net::{Bytes, Leased};
-use shin::record::{ContentType, PlaintextRecord, RecordError};
+use dope_net::wire::buffered::{Buffer, Buffered, FillError, Scratch, ScratchPool};
+use dope_net::{Bytes, Retained};
+use shin::wire::record::RecordError;
 
 use crate::{error::Error, staging::TLS_STAGING_CAP};
 
-const INCOMING_APP_CAP: usize = 1 << 20;
+pub(super) struct ReceiveOverflow;
 
-enum Incoming {
-    Owned(Vec<u8>),
-    Pooled {
-        pool: RecvPool,
-        data: Option<Buffer<Recv>>,
-    },
+pub(super) struct Pending<'a> {
+    buffer: &'a mut Option<Buffer<Scratch>>,
+    pool: &'a ScratchPool,
 }
 
-impl Incoming {
-    fn extend(&mut self, bytes: &[u8]) -> bool {
-        match self {
-            Self::Owned(data) => {
-                if data
-                    .len()
-                    .checked_add(bytes.len())
-                    .is_none_or(|required| required > INCOMING_APP_CAP)
-                {
-                    return false;
-                }
-                data.extend_from_slice(bytes);
-                true
-            }
-            Self::Pooled { pool, data } => {
-                if data.is_none() {
-                    *data = pool.try_acquire();
-                }
-                let Some(data) = data else {
-                    return false;
-                };
-                if data
-                    .len()
-                    .checked_add(bytes.len())
-                    .is_none_or(|required| required > data.capacity())
-                {
-                    return false;
-                }
-                data.try_extend_from_slice(bytes).is_ok()
-            }
+impl Pending<'_> {
+    pub(super) fn try_buffer(&mut self) -> Option<&mut Buffer<Scratch>> {
+        if self.buffer.is_none() {
+            *self.buffer = self.pool.try_acquire();
         }
-    }
-
-    fn take_vec(&mut self) -> Option<Vec<u8>> {
-        match self {
-            Self::Owned(data) if !data.is_empty() => Some(mem::take(data)),
-            Self::Owned(_) => None,
-            Self::Pooled { data, .. } => data.take().map(|data| data.as_slice().to_vec()),
-        }
-    }
-
-    fn take_leased(&mut self) -> Option<Bytes<Leased>> {
-        match self {
-            Self::Owned(_) => None,
-            Self::Pooled { data, .. } => data.take().map(Buffer::freeze),
-        }
+        self.buffer.as_mut()
     }
 }
 
 pub(crate) struct Buffers {
-    recv: Buffer<Scratch>,
-    pending: Buffer<Scratch>,
-    incoming: Incoming,
+    recv: Option<Buffer<Scratch>>,
+    recv_pool: ScratchPool,
+    pending: Option<Buffer<Scratch>>,
+    pending_pool: ScratchPool,
 }
 
 impl Buffers {
-    pub(crate) fn try_runtime(runtime: &Buffered) -> Option<Self> {
-        Some(Self {
-            recv: runtime.try_acquire_scratch()?,
-            pending: runtime.try_acquire_scratch()?,
-            incoming: Incoming::Pooled {
-                pool: runtime.recv_pool(),
-                data: None,
-            },
-        })
+    pub(crate) fn from_runtime(runtime: &Buffered) -> Self {
+        let pool = runtime.scratch_pool();
+        Self::pooled(pool.clone(), pool)
+    }
+
+    pub(crate) fn pooled(recv_pool: ScratchPool, pending_pool: ScratchPool) -> Self {
+        Self {
+            recv: None,
+            recv_pool,
+            pending: None,
+            pending_pool,
+        }
     }
 
     pub(super) fn standalone() -> Result<Self, Error> {
-        let runtime = Buffered::try_fixed(2, TLS_STAGING_CAP, 0, 1)
+        let pool = ScratchPool::try_new(2, TLS_STAGING_CAP)
             .map_err(|error| Error::Io(io::Error::new(ErrorKind::InvalidInput, error)))?;
-        Ok(Self {
-            recv: runtime
-                .try_acquire_scratch()
-                .ok_or(Error::BufferUnavailable)?,
-            pending: runtime
-                .try_acquire_scratch()
-                .ok_or(Error::BufferUnavailable)?,
-            incoming: Incoming::Owned(Vec::new()),
-        })
+        Ok(Self::pooled(pool.clone(), pool))
     }
 
-    pub(super) fn append_recv(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        let take = bytes.len().min(self.recv.spare_capacity());
-        self.recv
-            .try_extend_from_slice(&bytes[..take])
-            .map_err(|_| Error::ReceiveOverflow)?;
+    pub(super) fn append_recv(&mut self, bytes: &[u8]) -> Result<usize, ReceiveOverflow> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let recv = self.recv_mut()?;
+        let take = bytes.len().min(recv.spare_capacity());
+        recv.try_extend_from_slice(&bytes[..take])
+            .map_err(|_| ReceiveOverflow)?;
         Ok(take)
     }
 
     pub(super) fn recv(&self) -> &[u8] {
-        self.recv.as_slice()
+        self.recv.as_ref().map_or(&[], Buffer::as_slice)
     }
 
-    pub(super) fn recv_mut(&mut self) -> &mut [u8] {
-        self.recv.as_mut_slice()
+    pub(super) fn recv_record_and_pending(
+        &mut self,
+        total: usize,
+    ) -> Result<(&mut [u8], Pending<'_>), Error> {
+        let recv = self.recv.as_mut().ok_or(Error::BufferUnavailable)?;
+        Ok((
+            &mut recv.as_mut_slice()[..total],
+            Pending {
+                buffer: &mut self.pending,
+                pool: &self.pending_pool,
+            },
+        ))
     }
 
-    pub(super) fn consume_recv(&mut self, n: usize) {
-        self.recv.consume(n);
+    pub(super) fn try_consume_recv(&mut self, n: usize) -> bool {
+        let Some(recv) = self.recv.as_mut() else {
+            return n == 0;
+        };
+        let Ok(prefix) = recv.try_consume_prefix(n) else {
+            return false;
+        };
+        prefix.commit();
+        if recv.is_empty() {
+            self.recv = None;
+        }
+        true
+    }
+
+    pub(super) fn take_recv_range(&mut self, range: Range<usize>) -> Option<Bytes<Retained>> {
+        self.recv.take()?.freeze_range(range)
     }
 
     pub(super) fn pending(&self) -> &[u8] {
-        self.pending.as_slice()
+        self.pending.as_ref().map_or(&[], Buffer::as_slice)
     }
 
-    pub(super) fn pending_mut(&mut self) -> &mut Buffer<Scratch> {
-        &mut self.pending
+    pub(super) fn pending_output(&mut self) -> Pending<'_> {
+        Pending {
+            buffer: &mut self.pending,
+            pool: &self.pending_pool,
+        }
     }
 
     pub(super) fn pending_spare(&self) -> usize {
-        self.pending.spare_capacity()
-    }
-
-    pub(super) fn consume_pending(&mut self, n: usize) {
-        self.pending.consume(n);
-    }
-
-    pub(super) fn take_pending(&mut self) -> Vec<u8> {
-        let data = self.pending.as_slice().to_vec();
-        self.pending.consume(data.len());
-        data
-    }
-
-    pub(super) fn encode_plaintext(
-        &mut self,
-        content_type: ContentType,
-        data: &[u8],
-    ) -> Result<(), Error> {
         self.pending
-            .try_fill(|spare| PlaintextRecord::encode_into_uninit(content_type, data, spare))
-            .map_err(Self::fill_error)
+            .as_ref()
+            .map_or_else(|| self.pending_pool.capacity(), Buffer::spare_capacity)
     }
 
-    pub(super) fn extend_incoming(&mut self, range: Range<usize>) -> bool {
-        self.incoming.extend(&self.recv.as_slice()[range])
-    }
-
-    pub(super) fn take_vec(&mut self) -> Option<Vec<u8>> {
-        self.incoming.take_vec()
-    }
-
-    pub(super) fn take_leased(&mut self) -> Option<Bytes<Leased>> {
-        self.incoming.take_leased()
+    pub(super) fn try_consume_pending(&mut self, n: usize) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return n == 0;
+        };
+        let Ok(prefix) = pending.try_consume_prefix(n) else {
+            return false;
+        };
+        prefix.commit();
+        if pending.is_empty() {
+            self.pending = None;
+        }
+        true
     }
 
     pub(super) fn fill_error(error: FillError<RecordError>) -> Error {
@@ -172,5 +138,12 @@ impl Buffers {
             }
             FillError::Fill(error) => Error::Record(error),
         }
+    }
+
+    fn recv_mut(&mut self) -> Result<&mut Buffer<Scratch>, ReceiveOverflow> {
+        if self.recv.is_none() {
+            self.recv = Some(self.recv_pool.try_acquire().ok_or(ReceiveOverflow)?);
+        }
+        self.recv.as_mut().ok_or(ReceiveOverflow)
     }
 }

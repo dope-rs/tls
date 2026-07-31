@@ -1,4 +1,4 @@
-use shin::alert::AlertDescription;
+use shin::wire::alert::AlertDescription;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {

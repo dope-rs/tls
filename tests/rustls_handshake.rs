@@ -102,7 +102,7 @@ fn record_lengths(mut wire: &[u8]) -> Vec<usize> {
 
 #[test]
 fn rustls_records_fit_max_tls_record() {
-    use shin::record::{HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY};
+    use shin::wire::record::{HEADER_LEN, MAX_CIPHERTEXT_BODY, MAX_PLAINTEXT_BODY};
     const MAX_TLS_RECORD: usize = HEADER_LEN + MAX_CIPHERTEXT_BODY;
 
     install_provider();
@@ -227,7 +227,8 @@ mod endpoint {
         let (mut wire, _) = RustTls::prepare_open(&mut runtime)
             .expect("wire scratch budget")
             .commit();
-        let out = wire.process_recv(&mut runtime, &[]);
-        assert!(out.is_none());
+        let mut empty = [];
+        let out = RustTls::process_recv(&mut wire, &mut runtime, &mut empty);
+        assert_eq!(out.len(), 0);
     }
 }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use dope_tls::{clock::WallClock, state::State};
+use dope_tls::clock::WallClock;
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::aws_lc_rs::cipher_suite;
@@ -12,16 +12,16 @@ use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, ServerConfig, ServerConnection,
     SignatureScheme, SupportedCipherSuite,
 };
-use shin::asn1::{Reader, Tag};
-use shin::cert::Cert;
-use shin::client::{OwnedTrustAnchor, Verifier};
-use shin::record::CipherSuite;
-use shin::server::CertSource;
-use shin::sig::SigningKey;
+use shin::client::config::{OwnedTrustAnchor, Verifier};
+use shin::crypto::sig::SigningKey;
+use shin::identity::asn1::{Reader, Tag};
+use shin::identity::cert::Cert;
+use shin::server::config::CertSource;
+use shin::wire::record::CipherSuite;
 
 mod common;
 
-use common::TestServer;
+use common::{AppQueue, ClientState, ServerState, TestServer};
 
 const HOSTNAME: &str = "interop.local";
 const PUMP_CAP: usize = 64;
@@ -67,8 +67,8 @@ fn make_pki() -> Pki {
     let cert_der = cert.der().to_vec();
 
     let parsed = Cert::parse(&cert_der).unwrap();
-    let nb = shin::time::UnixTime::from_time_value(&parsed.validity.not_before).unwrap();
-    let na = shin::time::UnixTime::from_time_value(&parsed.validity.not_after).unwrap();
+    let nb = shin::identity::time::UnixTime::from_time_value(&parsed.validity.not_before).unwrap();
+    let na = shin::identity::time::UnixTime::from_time_value(&parsed.validity.not_after).unwrap();
     let valid_at = (nb.0 + na.0) / 2;
 
     Pki {
@@ -167,9 +167,9 @@ fn rustls_client_config(pki: &Pki, suite: SupportedCipherSuite) -> Arc<ClientCon
     )
 }
 
-fn dope_client(pki: &Pki, suite: CipherSuite) -> State {
-    State::new_client_with(
-        shin::client::Config {
+fn dope_client(pki: &Pki, suite: CipherSuite) -> ClientState {
+    ClientState::with(
+        shin::client::config::Config {
             verifier: Verifier::X509 {
                 anchors: vec![OwnedTrustAnchor::from_cert_der(&pki.cert_der).unwrap()],
                 hostname: HOSTNAME.as_bytes().to_vec(),
@@ -186,7 +186,7 @@ fn dope_client(pki: &Pki, suite: CipherSuite) -> State {
 }
 
 fn dope_server(pki: &Pki) -> TestServer {
-    let config = shin::server::Config {
+    let config = shin::server::config::Config {
         source: CertSource::X509 {
             chain_der: vec![pki.cert_der.clone()],
             signing_key: SigningKey::from_seed(&pki.signing_seed).unwrap(),
@@ -196,7 +196,7 @@ fn dope_server(pki: &Pki) -> TestServer {
     };
     config.validate().unwrap();
     TestServer::new(
-        State::new_server(shin::server::ConnectionConfig {
+        ServerState::new(shin::server::config::ConnectionConfig {
             transport_params: Vec::new(),
         })
         .expect("valid server buffer layout"),
@@ -204,7 +204,7 @@ fn dope_server(pki: &Pki) -> TestServer {
     )
 }
 
-fn pump_client<D>(dope: &mut State, peer: &mut rustls::ConnectionCommon<D>) {
+fn pump_client<D>(dope: &mut ClientState, peer: &mut rustls::ConnectionCommon<D>) {
     for _ in 0..PUMP_CAP {
         let mut progressed = false;
 
@@ -228,7 +228,7 @@ fn pump_client<D>(dope: &mut State, peer: &mut rustls::ConnectionCommon<D>) {
             if buf.is_empty() {
                 break;
             }
-            dope.read_client_tcp(&buf).expect("dope read_tcp");
+            dope.read_tcp(&buf).expect("dope read_tcp");
             progressed = true;
         }
 
@@ -272,7 +272,7 @@ fn pump_server<D>(dope: &mut TestServer, peer: &mut rustls::ConnectionCommon<D>)
     }
 }
 
-fn drain_app(dope: &mut State, want: usize) -> Vec<u8> {
+fn drain_app(dope: &mut impl AppQueue, want: usize) -> Vec<u8> {
     let mut got = Vec::new();
     while got.len() < want {
         match dope.pull_app() {
@@ -300,7 +300,10 @@ fn suites() -> [(CipherSuite, SupportedCipherSuite); 3] {
     ]
 }
 
-fn client_vs_rustls_server(shin_suite: CipherSuite, rustls_suite: SupportedCipherSuite) -> State {
+fn client_vs_rustls_server(
+    shin_suite: CipherSuite,
+    rustls_suite: SupportedCipherSuite,
+) -> ClientState {
     let pki = make_pki();
     let mut server =
         ServerConnection::new(rustls_server_config(&pki, rustls_suite)).expect("server conn");

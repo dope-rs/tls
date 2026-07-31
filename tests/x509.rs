@@ -1,13 +1,13 @@
 mod common;
 
-use common::{TestServer, pump};
-use dope_tls::{clock::WallClock, roots::WebPkiRoots, state::State};
+use common::{ClientState, ServerState, TestServer, pump};
+use dope_tls::{clock::WallClock, roots::WebPkiRoots};
 use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, PKCS_ED25519};
-use shin::asn1::{Reader, Tag};
-use shin::cert::{Cert, SubjectPublicKeyInfo};
-use shin::client::{OwnedTrustAnchor, Verifier};
-use shin::server::CertSource;
-use shin::sig::SigningKey;
+use shin::client::config::{OwnedTrustAnchor, Verifier};
+use shin::crypto::sig::SigningKey;
+use shin::identity::asn1::{Reader, Tag};
+use shin::identity::cert::{Cert, SubjectPublicKeyInfo};
+use shin::server::config::CertSource;
 
 const HOSTNAME: &str = "host.local";
 
@@ -89,12 +89,12 @@ fn from_cert_der_extracts_anchor_fields() {
 fn x509_handshake_round_trip() {
     let (cert_der, signing) = ed25519_self_signed();
     let cert = Cert::parse(&cert_der).unwrap();
-    let nb = shin::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
-    let na = shin::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
+    let nb = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_before).unwrap();
+    let na = shin::identity::time::UnixTime::from_time_value(&cert.validity.not_after).unwrap();
     let now = (nb.0 + na.0) / 2;
     let anchor = OwnedTrustAnchor::from_cert_der(&cert_der).unwrap();
 
-    let server_config = shin::server::Config {
+    let server_config = shin::server::config::Config {
         source: CertSource::X509 {
             chain_der: vec![cert_der.clone()],
             signing_key: signing,
@@ -104,14 +104,14 @@ fn x509_handshake_round_trip() {
     };
     server_config.validate().unwrap();
     let mut server = TestServer::new(
-        State::new_server(shin::server::ConnectionConfig {
+        ServerState::new(shin::server::config::ConnectionConfig {
             transport_params: Vec::new(),
         })
         .expect("valid server buffer layout"),
         shin::server::Shard::new(server_config),
     );
-    let mut client = State::new_client_with_clock(
-        shin::client::Config {
+    let mut client = ClientState::with_clock(
+        shin::client::config::Config {
             verifier: Verifier::X509 {
                 anchors: vec![anchor],
                 hostname: HOSTNAME.as_bytes().to_vec(),

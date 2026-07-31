@@ -24,7 +24,7 @@ fn tls_egress_handshake_then_app_record() {
 
     let first = client.pending_send_slice().to_vec();
     let n = first.len();
-    client.consume_pending_send(n);
+    client.consume_pending_send(n).unwrap();
     assert!(!first.is_empty(), "ClientHello must be emitted");
     assert_eq!(first[0], 0x16, "ClientHello is a handshake record (0x16)");
 
@@ -38,14 +38,11 @@ fn tls_egress_handshake_then_app_record() {
         let from_server = server.pull_send();
         let progressed = !from_client.is_empty() || !from_server.is_empty();
         if !from_server.is_empty() {
-            assert!(
-                client.try_read_client_tcp(&from_server),
-                "client.try_read_tcp"
-            );
+            assert!(client.try_read_tcp(&from_server), "client.try_read_tcp");
             while let Some(_chunk) = client.pull_app() {}
             let next = client.pending_send_slice().to_vec();
             let nn = next.len();
-            client.consume_pending_send(nn);
+            client.consume_pending_send(nn).unwrap();
             from_client = next;
         } else {
             from_client.clear();
@@ -65,7 +62,7 @@ fn tls_egress_handshake_then_app_record() {
     client.write_app(plaintext).expect("write_app");
     let app_wire = client.pending_send_slice().to_vec();
     let nn = app_wire.len();
-    client.consume_pending_send(nn);
+    client.consume_pending_send(nn).unwrap();
     assert!(!app_wire.is_empty(), "encrypted app data should be emitted");
     assert_eq!(
         app_wire[0], 0x17,

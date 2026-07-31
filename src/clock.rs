@@ -1,12 +1,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use shin::connection::Clock;
+
 #[derive(Debug, Clone, Copy)]
 pub enum WallClock {
     System,
     FixedMillis(u64),
 }
 
-impl shin::Clock for WallClock {
+impl Clock for WallClock {
     fn now_ms(&self) -> u64 {
         match self {
             Self::System => SystemTime::now()

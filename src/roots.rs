@@ -1,6 +1,6 @@
 use std::iter::FusedIterator;
 
-use shin::client::OwnedTrustAnchor;
+use shin::client::config::OwnedTrustAnchor;
 
 #[derive(Clone, Debug, Default)]
 pub struct WebPkiRoots {

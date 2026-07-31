@@ -1,7 +1,7 @@
-use dope_net::wire::buffered::{Buffer, Scratch};
-use shin::{
-    Epoch, KeyDirection,
-    record::{CipherSuite, ContentType, MAX_PLAINTEXT_BODY, Opener, Sealer},
+use dope_net::wire::buffered::{Buffer, FillError, Scratch};
+use shin::connection::{Epoch, KeyDirection};
+use shin::wire::record::{
+    CipherSuite, ContentType, MAX_PLAINTEXT_BODY, Opener, RecordError, RecordKeyError, Sealer,
 };
 
 use super::{buffer::Buffers, status::Phase};
@@ -9,6 +9,33 @@ use crate::error::Error;
 use crate::staging::TLS13_RECORD_OVERHEAD;
 
 const KEY_UPDATE_LEN: usize = TLS13_RECORD_OVERHEAD + 4 + 1;
+
+#[derive(Clone, Copy)]
+pub(super) enum TrafficFailure {
+    UnexpectedRecord,
+    NotEstablished,
+    Record(RecordError),
+    RecordKey(RecordKeyError),
+    SendOverflow,
+}
+
+impl From<RecordKeyError> for TrafficFailure {
+    fn from(error: RecordKeyError) -> Self {
+        Self::RecordKey(error)
+    }
+}
+
+impl From<TrafficFailure> for Error {
+    fn from(error: TrafficFailure) -> Self {
+        match error {
+            TrafficFailure::UnexpectedRecord => Self::UnexpectedRecord,
+            TrafficFailure::NotEstablished => Self::NotEstablished,
+            TrafficFailure::Record(error) => Self::Record(error),
+            TrafficFailure::RecordKey(error) => Self::RecordKey(error),
+            TrafficFailure::SendOverflow => Self::SendOverflow,
+        }
+    }
+}
 
 #[derive(Default)]
 struct Keys {
@@ -42,7 +69,7 @@ impl Traffic {
         spare >= KEY_UPDATE_LEN
     }
 
-    pub(super) fn opener(&mut self, phase: Phase) -> Result<&mut Opener, Error> {
+    pub(super) fn opener(&mut self, phase: Phase) -> Result<&mut Opener, TrafficFailure> {
         let opener = if phase == Phase::Handshaking {
             self.handshake.opener.as_mut()
         } else {
@@ -51,19 +78,19 @@ impl Traffic {
                 .as_mut()
                 .or(self.handshake.opener.as_mut())
         };
-        opener.ok_or(Error::UnexpectedRecord)
+        opener.ok_or(TrafficFailure::UnexpectedRecord)
     }
 
     pub(super) fn seal_handshake(
         &mut self,
         output: &mut Buffer<Scratch>,
         data: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<(), TrafficFailure> {
         let sealer = self
             .handshake
             .sealer
             .as_mut()
-            .ok_or(Error::UnexpectedRecord)?;
+            .ok_or(TrafficFailure::UnexpectedRecord)?;
         seal(output, sealer, ContentType::Handshake, data)
     }
 
@@ -72,12 +99,12 @@ impl Traffic {
         output: &mut Buffer<Scratch>,
         content_type: ContentType,
         data: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<(), TrafficFailure> {
         let sealer = self
             .application
             .sealer
             .as_mut()
-            .ok_or(Error::NotEstablished)?;
+            .ok_or(TrafficFailure::NotEstablished)?;
         seal(output, sealer, content_type, data)
     }
 
@@ -107,13 +134,47 @@ impl Traffic {
         Ok(consumed)
     }
 
+    pub(super) fn write_application_parts<'a>(
+        &mut self,
+        phase: Phase,
+        output: &mut Buffer<Scratch>,
+        plaintext_len: usize,
+        parts: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<usize, Error> {
+        if phase != Phase::Established {
+            return Err(Error::NotEstablished);
+        }
+        if plaintext_len > MAX_PLAINTEXT_BODY {
+            return Err(Error::Record(RecordError::BodyTooLarge));
+        }
+        if output.spare_capacity() < plaintext_len + TLS13_RECORD_OVERHEAD {
+            return Ok(0);
+        }
+        let sealer = self
+            .application
+            .sealer
+            .as_mut()
+            .ok_or(Error::NotEstablished)?;
+        output
+            .try_fill(|spare| {
+                sealer.seal_parts_into_uninit(
+                    ContentType::ApplicationData,
+                    plaintext_len,
+                    parts,
+                    spare,
+                )
+            })
+            .map_err(Buffers::fill_error)?;
+        Ok(plaintext_len)
+    }
+
     pub(super) fn install(
         &mut self,
         epoch: Epoch,
         read_secret: &[u8],
         write_secret: &[u8],
         suite: CipherSuite,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TrafficFailure> {
         let keys = match epoch {
             Epoch::Handshake => &mut self.handshake,
             Epoch::Application => &mut self.application,
@@ -129,7 +190,7 @@ impl Traffic {
         direction: KeyDirection,
         secret: &[u8],
         suite: CipherSuite,
-    ) -> Result<(), Error> {
+    ) -> Result<(), TrafficFailure> {
         match direction {
             KeyDirection::Read => {
                 self.application.opener = Some(Opener::with_suite(secret, suite)?);
@@ -147,8 +208,13 @@ fn seal(
     sealer: &mut Sealer,
     content_type: ContentType,
     data: &[u8],
-) -> Result<(), Error> {
+) -> Result<(), TrafficFailure> {
     output
         .try_fill(|spare| sealer.seal_into_uninit(content_type, data, spare))
-        .map_err(Buffers::fill_error)
+        .map_err(|error| match error {
+            FillError::Fill(RecordError::BufferTooSmall) | FillError::Capacity => {
+                TrafficFailure::SendOverflow
+            }
+            FillError::Fill(error) => TrafficFailure::Record(error),
+        })
 }

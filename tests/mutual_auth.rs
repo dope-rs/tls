@@ -1,7 +1,7 @@
 mod common;
 
-use common::{TestServer, pump, signing_key};
-use dope_tls::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity, state::State};
+use common::{ClientState, ServerState, TestServer, pump, signing_key};
+use dope_tls::{ClientAuth, ClientCertSource, ClientCertVerifier, ClientIdentity};
 
 struct PinnedVerifier {
     expected_spki: Vec<u8>,
@@ -14,14 +14,14 @@ impl ClientCertVerifier for PinnedVerifier {
 }
 
 fn client_spki(pubkey: [u8; 32]) -> Vec<u8> {
-    shin::spki::SubjectPublicKey::Ed25519(pubkey)
+    shin::identity::spki::SubjectPublicKey::Ed25519(pubkey)
         .encode()
         .unwrap()
 }
 
-fn server_config(signing: shin::sig::SigningKey) -> shin::server::Config {
-    shin::server::Config {
-        source: shin::server::CertSource::RawPublicKey {
+fn server_config(signing: shin::crypto::sig::SigningKey) -> shin::server::config::Config {
+    shin::server::config::Config {
+        source: shin::server::config::CertSource::RawPublicKey {
             signing_key: signing,
         },
         alpn_protocols: Vec::new(),
@@ -29,9 +29,9 @@ fn server_config(signing: shin::sig::SigningKey) -> shin::server::Config {
     }
 }
 
-fn client_config(server_pubkey: [u8; 32]) -> shin::client::Config {
-    shin::client::Config {
-        verifier: shin::client::Verifier::RawPublicKey {
+fn client_config(server_pubkey: [u8; 32]) -> shin::client::config::Config {
+    shin::client::config::Config {
+        verifier: shin::client::config::Verifier::RawPublicKey {
             expected_pubkey: server_pubkey,
         },
         transport_params: Vec::new(),
@@ -42,12 +42,12 @@ fn client_config(server_pubkey: [u8; 32]) -> shin::client::Config {
 }
 
 fn server(
-    config: shin::server::Config,
+    config: shin::server::config::Config,
     verifier: PinnedVerifier,
-) -> TestServer<shin::server::NoGuard, PinnedVerifier> {
+) -> TestServer<shin::server::config::NoGuard, PinnedVerifier> {
     config.validate().unwrap();
     TestServer::new(
-        State::new_server(shin::server::ConnectionConfig {
+        ServerState::new(shin::server::config::ConnectionConfig {
             transport_params: Vec::new(),
         })
         .unwrap(),
@@ -68,7 +68,7 @@ fn required_client_auth_completes_and_pins_spki() {
             expected_spki: client_spki(client_pubkey),
         },
     );
-    let mut client = State::new_client_mutual(
+    let mut client = ClientState::mutual(
         client_config(server_pubkey),
         ClientCertSource::RawPublicKey {
             signing_key: client_signing,
@@ -86,9 +86,7 @@ fn required_client_auth_completes_and_pins_spki() {
     assert_eq!(server.pull_app().unwrap().as_slice(), b"client to server");
 
     server.write_app(b"server to client").unwrap();
-    client
-        .read_client_tcp(&server.pull_send())
-        .expect("client read");
+    client.read_tcp(&server.pull_send()).expect("client read");
     assert_eq!(client.pull_app().unwrap().as_slice(), b"server to client");
 }
 
@@ -103,7 +101,7 @@ fn required_server_rejects_anonymous_client() {
             expected_spki: vec![0u8; 44],
         },
     );
-    let mut client = State::new_client(client_config(server_pubkey)).unwrap();
+    let mut client = ClientState::new(client_config(server_pubkey)).unwrap();
 
     pump(&mut client, &mut server);
 
@@ -126,7 +124,7 @@ fn required_server_rejects_unauthorized_client() {
     );
 
     let other_signing = signing_key();
-    let mut client = State::new_client_mutual(
+    let mut client = ClientState::mutual(
         client_config(server_pubkey),
         ClientCertSource::RawPublicKey {
             signing_key: other_signing,
