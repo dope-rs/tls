@@ -1,7 +1,7 @@
 use std::option::IntoIter;
 
-use dope_net::wire::{RecvChunk, RecvCredit, RecvCreditGuard, RecvCursor, RecvTarget};
-use dope_net::{Borrowed, Bytes, ProvidedLease, Retained};
+use dope_net::wire::{Lease, RecvChunk, RecvCredit, RecvCreditGuard, RecvCursor, RecvTarget};
+use dope_net::{Borrowed, Bytes, Retained};
 
 use crate::state::direct::{PlainChunks, PlainCursor, PlainLayout};
 use crate::state::status::PeerClose;
@@ -48,7 +48,7 @@ impl ExactSizeIterator for TlsRecvBatch<'_> {
 }
 
 struct TlsProvided<'d> {
-    bytes: ProvidedLease<'d>,
+    bytes: Lease<'d>,
     cursor: PlainCursor,
 }
 
@@ -155,7 +155,7 @@ pub(super) struct RetainedResult {
 }
 
 impl RetainedResult {
-    pub(super) fn into_cursor<'d>(self, mut bytes: ProvidedLease<'d>) -> Option<TlsRetained<'d>> {
+    pub(super) fn into_cursor<'d>(self, mut bytes: Lease<'d>) -> Option<TlsRetained<'d>> {
         let provided = self.layout.and_then(|layout| {
             (layout.plain_len() != 0).then(|| {
                 bytes.advance(self.plain_offset);

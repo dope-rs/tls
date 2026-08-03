@@ -18,7 +18,7 @@ use dope::manifold::listener::egress::SlotEgress;
 use dope::manifold::listener::state::{EgressCtx, State};
 use dope::runtime::executor::Executor;
 use dope::runtime::profile;
-use dope_net::link::egress::storage::Storage as EgressStorage;
+use dope_net::link::egress;
 use dope_net::link::slot::Slot;
 use dope_net::tcp::Tcp;
 use dope_net::{Bytes, RetainBytes};
@@ -97,7 +97,7 @@ impl<'d> ApplicationHooks<'d, ReplyApp> for ReplyApp {
     fn chunk<R: RetainBytes>(
         app: Pin<&mut ReplyApp>,
         slot: &mut Slot<'d, RustTls, State<()>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         _chunk: R,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
@@ -113,7 +113,7 @@ impl<'d> ApplicationHooks<'d, ReplyApp> for ReplyApp {
     fn close(
         app: Pin<&mut ReplyApp>,
         _slot: &mut Slot<'d, RustTls, State<()>>,
-        _egress: EgressCtx<'_, '_>,
+        _egress: EgressCtx<'_, 'd, '_>,
     ) {
         let closes = &app.get_mut().closes;
         closes.set(closes.get() + 1);
@@ -202,7 +202,7 @@ fn rustls_vectored_reply_coalesces_records_and_closes() {
     let cfg = dope::driver::Config::for_tcp_profile::<profile::Throughput>(16);
     let exec = Executor::new(cfg)
         .expect("executor")
-        .with_storage(EgressStorage::default());
+        .with_storage(egress::storage::Storage::default());
     exec.enter(|mut sess| {
         let egress = sess.storage();
         let bind: SocketAddr = "127.0.0.1:0".parse().expect("bind");

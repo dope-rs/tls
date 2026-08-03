@@ -194,6 +194,7 @@ mod endpoint {
         let mut runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), ep)
             .expect("valid test runtime limits");
         let (wire, _) = RustTls::prepare_open(&mut runtime)
+            .expect("valid rustls endpoint")
             .expect("wire scratch budget")
             .commit();
         assert!(wire.alpn_protocol().is_none());
@@ -207,6 +208,7 @@ mod endpoint {
         let mut runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), ep)
             .expect("valid test runtime limits");
         let (wire, _) = RustTls::prepare_open(&mut runtime)
+            .expect("valid rustls endpoint")
             .expect("wire scratch budget")
             .commit();
         assert!(wire.alpn_protocol().is_none());
@@ -225,6 +227,7 @@ mod endpoint {
         let mut runtime = RustTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), ep)
             .expect("valid test runtime limits");
         let (mut wire, _) = RustTls::prepare_open(&mut runtime)
+            .expect("valid rustls endpoint")
             .expect("wire scratch budget")
             .commit();
         let mut empty = [];

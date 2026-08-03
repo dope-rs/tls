@@ -15,7 +15,7 @@ use dope::manifold::listener::egress::SlotEgress;
 use dope::manifold::listener::state::{EgressCtx, State};
 use dope::runtime::executor::Executor;
 use dope::runtime::profile;
-use dope_net::link::egress::storage::Storage as EgressStorage;
+use dope_net::link::egress;
 use dope_net::link::slot::Slot;
 use dope_net::tcp::Tcp;
 use dope_net::{Bytes, RetainBytes};
@@ -45,7 +45,7 @@ impl<'d> ApplicationHooks<'d, ReplyApp> for ReplyApp {
     fn chunk<R: RetainBytes>(
         app: Pin<&mut ReplyApp>,
         slot: &mut Slot<'d, Tls, State<()>>,
-        mut egress: EgressCtx<'_, '_>,
+        mut egress: EgressCtx<'_, 'd, '_>,
         _chunk: R,
         driver: &mut DriverContext<'_, 'd>,
     ) -> Outcome {
@@ -61,7 +61,7 @@ impl<'d> ApplicationHooks<'d, ReplyApp> for ReplyApp {
     fn close(
         app: Pin<&mut ReplyApp>,
         _slot: &mut Slot<'d, Tls, State<()>>,
-        _egress: EgressCtx<'_, '_>,
+        _egress: EgressCtx<'_, 'd, '_>,
     ) {
         let closes = &app.get_mut().closes;
         closes.set(closes.get() + 1);
@@ -176,7 +176,7 @@ fn vectored_reply_coalesces_records_before_graceful_close() {
 
     let cfg = dope::driver::Config::for_tcp_profile::<profile::Throughput>(16);
     let exec = Executor::new(cfg).expect("executor").with_storage((
-        EgressStorage::default(),
+        egress::storage::Storage::default(),
         SessionStorage::try_with_capacity(16).expect("TLS session storage"),
     ));
     exec.enter(|mut sess| {

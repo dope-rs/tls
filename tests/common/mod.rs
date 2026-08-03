@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use dope::runtime::dispatcher::Dispatcher;
 use dope::runtime::executor::AppSession;
 use dope_fiber::abi::pollfn::PollFn;
-use dope_fiber::extensions::AppSessionExt as _;
+use dope_fiber::extensions::AppSessionExt;
 use dope_net::{Bytes, Retained};
 use dope_tls::{
     clock::WallClock,
@@ -285,7 +285,10 @@ pub(crate) fn raw_pair_with_suites(
             enable_early_data: false,
         },
         WallClock::System,
-        |c| c.set_cipher_suites(suites),
+        |c| {
+            c.set_cipher_suites(suites)
+                .expect("new client must be configurable");
+        },
     )
     .unwrap();
     (client, raw_server(signing))

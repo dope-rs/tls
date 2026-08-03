@@ -7,6 +7,7 @@ use dope_tls::state::{
     State,
     sessions::{Client, Server},
 };
+use dope_tls::tls::ClientSetup;
 use shin::crypto::sig::SigningKey;
 use shin::server::Shard;
 use shin::server::config::{CertSource, Config, ConnectionConfig, NoClientAuth, NoGuard};
@@ -59,6 +60,28 @@ fn measured<T>(run: impl FnOnce() -> T) -> (T, usize) {
     COUNTING.with(|counting| counting.set(false));
     let allocations = ALLOCATIONS.with(Cell::get);
     (output, allocations)
+}
+
+#[test]
+fn validated_client_setup_repeats_without_allocating() {
+    let mut setup = ClientSetup::new(shin::client::config::Config {
+        verifier: shin::client::config::Verifier::RawPublicKey {
+            expected_pubkey: [7; 32],
+        },
+        transport_params: Vec::new(),
+        alpn_protocols: Vec::new(),
+        resumption: None,
+        enable_early_data: false,
+    })
+    .unwrap();
+
+    let (_, allocations) = measured(|| {
+        for _ in 0..1024 {
+            drop(setup.for_next_dial());
+        }
+    });
+
+    assert_eq!(allocations, 0);
 }
 
 fn pump(

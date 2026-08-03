@@ -1,7 +1,7 @@
 use dope_net::wire::buffered::{Buffer, Buffered, Scratch};
 use dope_net::{Bytes, Retained};
 use shin::client;
-use shin::client::config::{ClientCertSource, Config};
+use shin::client::config::{ClientCertSource, ClientCertTemplate, Config, PreparedConfig};
 use shin::server;
 use shin::server::config::{ClientCertVerifier, ConnectionConfig, EarlyDataGuard};
 use shin::wire::alert::{Alert, AlertDescription};
@@ -11,7 +11,8 @@ use buffer::Buffers;
 use direct::{Direct, PlainChunks};
 use record::RecordState;
 use sessions::{
-    Client, ClientSession, Pool, PooledClient, PooledServer, Server, ServerSession, Session,
+    Client, ClientReservation, ClientSession, Pool, PooledClient, PooledServer, Server,
+    ServerSession, Session,
 };
 use staged::Staged;
 use status::{PeerClose, Phase};
@@ -60,7 +61,8 @@ impl State<Client> {
         clock: WallClock,
         cert: ClientCertSource,
     ) -> Result<Self, Error> {
-        Self::with(config, clock, move |client| client.set_client_cert(cert))
+        let session = Client::mutual(config, clock, cert)?;
+        Self::start(session, Buffers::standalone()?)
     }
 
     pub(crate) fn with_buffers(
@@ -74,15 +76,15 @@ impl State<Client> {
 }
 
 impl<'d> State<PooledClient<'d>> {
-    pub(crate) fn with_pool(
-        config: Config,
+    pub(crate) fn with_reservation(
+        reservation: ClientReservation<'d>,
+        config: PreparedConfig,
+        cert: Option<ClientCertTemplate>,
         clock: WallClock,
-        configure: impl FnOnce(&mut client::Client<WallClock>),
         buffers: Buffers,
-        sessions: &'d Pool<client::Client<WallClock>>,
     ) -> Result<Self, Error> {
         Self::start(
-            PooledClient::new_in(sessions, config, clock, configure)?,
+            PooledClient::new_reserved(reservation, config, cert, clock),
             buffers,
         )
     }

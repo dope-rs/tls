@@ -1,5 +1,6 @@
 use std::{error, fmt, io};
 
+use shin::client::config;
 use shin::connection;
 use shin::wire::{
     alert::AlertDescription,
@@ -9,6 +10,7 @@ use shin::wire::{
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    InvalidConfig(config::ConfigError),
     Handshake(connection::Error),
     Record(RecordError),
     RecordKey(RecordKeyError),
@@ -55,6 +57,7 @@ impl PartialEq for Error {
             | (Self::EarlyDataUnsupported, Self::EarlyDataUnsupported)
             | (Self::MalformedAlert, Self::MalformedAlert)
             | (Self::Truncated, Self::Truncated) => true,
+            (Self::InvalidConfig(a), Self::InvalidConfig(b)) => a == b,
             (Self::Handshake(a), Self::Handshake(b)) => a == b,
             (Self::Record(a), Self::Record(b)) => a == b,
             (Self::RecordKey(a), Self::RecordKey(b)) => a == b,
@@ -68,6 +71,7 @@ impl PartialEq for Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidConfig(error) => write!(formatter, "invalid TLS client config: {error}"),
             Self::Handshake(error) => write!(formatter, "TLS handshake failed: {error:?}"),
             Self::Record(error) => write!(formatter, "TLS record failed: {error:?}"),
             Self::RecordKey(error) => write!(formatter, "TLS record key failed: {error:?}"),
@@ -89,6 +93,7 @@ impl fmt::Display for Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
+            Self::InvalidConfig(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
         }

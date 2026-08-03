@@ -1,6 +1,6 @@
-use o3::collections::{LeaseSlab, LeaseSlabError, SlabLease};
+use o3::collections::{LeaseSlab, LeaseSlabError, LeaseSlabVacantEntry, SlabLease};
 use shin::client;
-use shin::client::config::Config;
+use shin::client::config::{ClientCertSource, ClientCertTemplate, Config, PreparedConfig};
 use shin::connection::{DriveError, Epoch, EventSink};
 use shin::server;
 use shin::server::config::{ClientCertVerifier, ConnectionConfig, EarlyDataGuard};
@@ -57,6 +57,8 @@ pub struct Client(Box<client::Client<WallClock>>);
 
 #[doc(hidden)]
 pub struct PooledClient<'d>(SlabLease<'d, client::Client<WallClock>>);
+
+pub(crate) struct ClientReservation<'d>(LeaseSlabVacantEntry<'d, client::Client<WallClock>>);
 
 pub struct Server(Box<server::Server<WallClock>>);
 
@@ -148,39 +150,61 @@ impl<T> Pool<T> {
     }
 }
 
+impl Pool<client::Client<WallClock>> {
+    pub(crate) fn reserve_client(&self) -> Option<ClientReservation<'_>> {
+        self.0.vacant_entry().map(ClientReservation)
+    }
+}
+
 impl Client {
     pub(super) fn new(
         config: Config,
         clock: WallClock,
         configure: impl FnOnce(&mut client::Client<WallClock>),
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::Handshake)?;
-        let mut client = Box::new(client::Client::with_workspace(
+        let config = config.try_into_prepared().map_err(Error::InvalidConfig)?;
+        let mut client = Box::new(client::Client::with_template_workspace(
             config,
+            None,
             clock,
             HandshakeWorkspace::for_client(),
         ));
         configure(&mut client);
         Ok(Self(client))
     }
+
+    pub(super) fn mutual(
+        config: Config,
+        clock: WallClock,
+        cert: ClientCertSource,
+    ) -> Result<Self, Error> {
+        let config = config.try_into_prepared().map_err(Error::InvalidConfig)?;
+        let cert = cert.try_into_template().map_err(Error::InvalidConfig)?;
+        Ok(Self(Box::new(client::Client::with_template_workspace(
+            config,
+            Some(cert),
+            clock,
+            HandshakeWorkspace::for_client(),
+        ))))
+    }
 }
 
 impl<'d> PooledClient<'d> {
-    pub(super) fn new_in(
-        pool: &'d Pool<client::Client<WallClock>>,
-        config: Config,
+    pub(super) fn new_reserved(
+        reservation: ClientReservation<'d>,
+        config: PreparedConfig,
+        cert: Option<ClientCertTemplate>,
         clock: WallClock,
-        configure: impl FnOnce(&mut client::Client<WallClock>),
-    ) -> Result<Self, Error> {
-        config.validate().map_err(Error::Handshake)?;
-        let vacant = pool.0.vacant_entry().ok_or(Error::BufferUnavailable)?;
-        let mut client = vacant.insert(client::Client::with_workspace(
-            config,
-            clock,
-            HandshakeWorkspace::for_client(),
-        ));
-        configure(&mut client);
-        Ok(Self(client))
+    ) -> Self {
+        let client = reservation
+            .0
+            .insert(client::Client::with_template_workspace(
+                config,
+                cert,
+                clock,
+                HandshakeWorkspace::for_client(),
+            ));
+        Self(client)
     }
 }
 
@@ -201,7 +225,6 @@ impl<'d> PooledServer<'d> {
         config: ConnectionConfig,
         clock: WallClock,
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::Handshake)?;
         let vacant = pool.0.vacant_entry().ok_or(Error::BufferUnavailable)?;
         Ok(Self(vacant.insert(server::Server::with_workspace(
             config,

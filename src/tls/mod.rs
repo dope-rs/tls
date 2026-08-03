@@ -6,13 +6,15 @@ use std::{
 
 use dope_net::wire::send::{Plain, Prepared, SendStorage, Storage, Vectored};
 use dope_net::wire::{
-    OpenRollback, Reclaim, RecvCredit, RuntimeLimits, Wire,
+    Lease, OpenRollback, Reclaim, RecvCredit, RuntimeLimits, Wire,
     buffered::{Buffer, Scratch, ScratchPool},
     reservation::ReservedOpen,
 };
-use dope_net::{Bytes, ProvidedLease, Retained};
+use dope_net::{Bytes, Retained};
 use shin::client;
-use shin::client::config::{self, ClientCertSource};
+use shin::client::config::{
+    self, ClientCertSource, ClientCertTemplate, ConfigTemplate, PreparedConfig,
+};
 use shin::crypto::ticket::TicketKeys;
 use shin::server;
 use shin::server::Shard;
@@ -21,7 +23,7 @@ use shin::server::config::{
 };
 
 use crate::clock::WallClock;
-use crate::error::Error as TlsError;
+use crate::error;
 use crate::send::{SendBuffer, SendProtocol, Sender};
 use crate::staging::{MAX_TLS_RECORD, TLS_STAGING_CAP};
 use crate::state::buffer::Buffers;
@@ -77,38 +79,88 @@ where
 type PolicyShard<P> = Shard<<P as ServerPolicy>::Guard, <P as ServerPolicy>::Verifier>;
 
 pub struct ClientSetup {
-    config: config::Config,
-    cert: Option<ClientCertSource>,
+    config: PreparedConfig,
+    template: ConfigTemplate,
+    cert: Option<ClientCertTemplate>,
+}
+
+/// One validated, connection-local TLS setup produced by a [`ClientSource`].
+///
+/// This is distinct from [`ClientSetup`], which owns the reusable endpoint
+/// template. Keeping the dial value template-free avoids a redundant `Rc`
+/// clone on every connection while making one-shot and reusable roles explicit.
+#[doc(hidden)]
+pub struct ClientDial {
+    config: PreparedConfig,
+    cert: Option<ClientCertTemplate>,
 }
 
 impl ClientSetup {
-    pub fn new(config: config::Config) -> Self {
-        Self { config, cert: None }
+    pub fn new(config: config::Config) -> Result<Self, error::Error> {
+        let config = config
+            .try_into_prepared()
+            .map_err(error::Error::InvalidConfig)?;
+        let template = config.template();
+        Ok(Self {
+            config,
+            template,
+            cert: None,
+        })
     }
 
-    pub fn mutual(config: config::Config, cert: ClientCertSource) -> Self {
-        Self {
+    pub fn mutual(config: config::Config, cert: ClientCertSource) -> Result<Self, error::Error> {
+        let mut setup = Self::new(config)?;
+        setup.cert = Some(
+            cert.try_into_template()
+                .map_err(error::Error::InvalidConfig)?,
+        );
+        Ok(setup)
+    }
+
+    /// Clones the validated endpoint template for one dial and transfers the
+    /// initial resumption ticket at most once.
+    pub fn for_next_dial(&mut self) -> ClientDial {
+        let config = mem::replace(&mut self.config, self.template.clone().without_resumption());
+        ClientDial {
             config,
-            cert: Some(cert),
+            cert: self.cert.clone(),
         }
     }
 }
 
+/// Supplies an already validated TLS setup for each outbound dial.
+///
+/// This source is deliberately total: resource backpressure is owned by the
+/// runtime pools, while a source always supplies a setup after those resources
+/// have been reserved. [`ClientSetup`]'s private fields make successful
+/// construction the proof that static configuration is valid.
+///
+/// ```compile_fail
+/// use dope_tls::tls::{ClientDial, ClientSource};
+///
+/// struct Exhaustible;
+///
+/// impl ClientSource for Exhaustible {
+///     fn next(&mut self) -> Option<ClientDial> {
+///         None
+///     }
+/// }
+/// ```
 pub trait ClientSource: 'static {
-    fn next(&mut self) -> Option<ClientSetup>;
+    fn next(&mut self) -> ClientDial;
 }
 
-pub struct OnceClient(Option<ClientSetup>);
+pub struct StaticClientSource(ClientSetup);
 
-impl ClientSource for OnceClient {
-    fn next(&mut self) -> Option<ClientSetup> {
-        self.0.take()
+impl ClientSource for StaticClientSource {
+    fn next(&mut self) -> ClientDial {
+        self.0.for_next_dial()
     }
 }
 
 pub struct Server<P = Standard>(PhantomData<fn() -> P>);
 
-pub struct Client<S = OnceClient>(PhantomData<fn() -> S>);
+pub struct Client<S = StaticClientSource>(PhantomData<fn() -> S>);
 
 pub struct ServerRuntime<'d, P: ServerPolicy> {
     shard: PolicyShard<P>,
@@ -141,7 +193,7 @@ pub trait Role: sealed::Sealed + Sized + 'static {
         runtime: &mut Self::Runtime<'d>,
         recv: ScratchPool,
         pending: ScratchPool,
-    ) -> Option<State<Self::Session<'d>>>;
+    ) -> Result<Option<State<Self::Session<'d>>>, error::Error>;
 
     #[doc(hidden)]
     fn read_staged<'d>(
@@ -182,16 +234,19 @@ impl<P: ServerPolicy> Role for Server<P> {
         runtime: &mut Self::Runtime<'d>,
         recv: ScratchPool,
         pending: ScratchPool,
-    ) -> Option<State<Self::Session<'d>>> {
-        State::<PooledServer<'d>>::with_pool(
+    ) -> Result<Option<State<Self::Session<'d>>>, error::Error> {
+        match State::<PooledServer<'d>>::with_pool(
             ConnectionConfig {
                 transport_params: Vec::new(),
             },
             WallClock::System,
             Buffers::pooled(recv, pending),
             runtime.sessions,
-        )
-        .ok()
+        ) {
+            Ok(state) => Ok(Some(state)),
+            Err(error::Error::BufferUnavailable) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn read_staged<'d>(
@@ -225,30 +280,35 @@ impl<S: ClientSource> Role for Client<S> {
 
     fn runtime<'d>(
         _: RuntimeLimits,
-        source: Self::Endpoint,
+        endpoint: Self::Endpoint,
         sessions: &'d Self::Storage,
     ) -> io::Result<Self::Runtime<'d>> {
-        Ok(ClientRuntime { source, sessions })
+        Ok(ClientRuntime {
+            source: endpoint,
+            sessions,
+        })
     }
 
     fn open<'d>(
         runtime: &mut Self::Runtime<'d>,
         recv: ScratchPool,
         pending: ScratchPool,
-    ) -> Option<State<Self::Session<'d>>> {
-        let ClientSetup { config, cert } = runtime.source.next()?;
-        State::<PooledClient<'d>>::with_pool(
+    ) -> Result<Option<State<Self::Session<'d>>>, error::Error> {
+        let Some(session) = runtime.sessions.reserve_client() else {
+            return Ok(None);
+        };
+        let Some(pending_buffer) = pending.try_acquire() else {
+            return Ok(None);
+        };
+        let ClientDial { config, cert } = runtime.source.next();
+        State::<PooledClient<'d>>::with_reservation(
+            session,
             config,
+            cert,
             WallClock::System,
-            move |client| {
-                if let Some(cert) = cert {
-                    client.set_client_cert(cert);
-                }
-            },
-            Buffers::pooled(recv, pending),
-            runtime.sessions,
+            Buffers::with_pending(recv, pending, pending_buffer),
         )
-        .ok()
+        .map(Some)
     }
 
     fn read_staged<'d>(
@@ -417,8 +477,8 @@ impl<R: Role> Endpoint<R> {
 }
 
 impl Endpoint<Server> {
-    pub fn server(config: Config) -> Result<Self, TlsError> {
-        config.validate().map_err(TlsError::Handshake)?;
+    pub fn server(config: Config) -> Result<Self, error::Error> {
+        config.validate().map_err(error::Error::Handshake)?;
         Ok(Self {
             role: Shard::new(config),
             retained_fragments: None,
@@ -430,8 +490,8 @@ impl<G> Endpoint<Server<Standard<G>>>
 where
     G: EarlyDataGuard + 'static,
 {
-    pub fn server_with_early_data_guard(config: Config, guard: G) -> Result<Self, TlsError> {
-        config.validate().map_err(TlsError::Handshake)?;
+    pub fn server_with_early_data_guard(config: Config, guard: G) -> Result<Self, error::Error> {
+        config.validate().map_err(error::Error::Handshake)?;
         Ok(Self {
             role: Shard::with_early_data_guard(config, guard),
             retained_fragments: None,
@@ -443,8 +503,12 @@ impl<V> Endpoint<Server<Mutual<NoGuard, V>>>
 where
     V: ClientCertVerifier + 'static,
 {
-    pub fn server_mutual(config: Config, auth: ClientAuth, verifier: V) -> Result<Self, TlsError> {
-        config.validate().map_err(TlsError::Handshake)?;
+    pub fn server_mutual(
+        config: Config,
+        auth: ClientAuth,
+        verifier: V,
+    ) -> Result<Self, error::Error> {
+        config.validate().map_err(error::Error::Handshake)?;
         Ok(Self {
             role: Shard::with_client_auth(config, auth, verifier),
             retained_fragments: None,
@@ -462,8 +526,8 @@ where
         guard: G,
         auth: ClientAuth,
         verifier: V,
-    ) -> Result<Self, TlsError> {
-        config.validate().map_err(TlsError::Handshake)?;
+    ) -> Result<Self, error::Error> {
+        config.validate().map_err(error::Error::Handshake)?;
         Ok(Self {
             role: Shard::with_early_data_guard_and_client_auth(config, guard, auth, verifier),
             retained_fragments: None,
@@ -471,19 +535,22 @@ where
     }
 }
 
-impl Endpoint<Client<OnceClient>> {
-    pub fn client(config: config::Config) -> Self {
-        Self {
-            role: OnceClient(Some(ClientSetup::new(config))),
+impl Endpoint<Client<StaticClientSource>> {
+    pub fn client(config: config::Config) -> Result<Self, error::Error> {
+        Ok(Self {
+            role: StaticClientSource(ClientSetup::new(config)?),
             retained_fragments: None,
-        }
+        })
     }
 
-    pub fn client_mutual(config: config::Config, cert: ClientCertSource) -> Self {
-        Self {
-            role: OnceClient(Some(ClientSetup::mutual(config, cert))),
+    pub fn client_mutual(
+        config: config::Config,
+        cert: ClientCertSource,
+    ) -> Result<Self, error::Error> {
+        Ok(Self {
+            role: StaticClientSource(ClientSetup::mutual(config, cert)?),
             retained_fragments: None,
-        }
+        })
     }
 }
 
@@ -552,8 +619,7 @@ impl SendState {
     }
 }
 
-// SAFETY: an acquired fixed pool buffer mutates only through exclusive SendState access.
-unsafe impl SendStorage for SendState {
+impl SendStorage for SendState {
     fn as_slice(&self) -> &[u8] {
         self.buffer.as_ref().map_or(&[], Buffer::as_slice)
     }
@@ -632,6 +698,7 @@ impl<R: Role> Wire for Tls<R> {
         = ReservedOpen<'a, Self::Connection<'d>, Self::SendStorage, Self::RuntimeContext<'d>>
     where
         'd: 'a;
+    type OpenError = error::Error;
     type Recv<'a> = Bytes<Retained>;
     type RecvBatch<'a> = recv::TlsRecvBatch<'a>;
     type RetainedRecv<'d> = recv::TlsRetained<'d>;
@@ -658,6 +725,7 @@ impl<R: Role> Wire for Tls<R> {
         let BoundEndpoint { endpoint, storage } = config;
         let config = endpoint;
         let layout = config.buffer_layout(limits)?;
+        let role = R::runtime(limits, config.role, &storage.role)?;
         let recv = ScratchPool::try_new(layout.recv_slots(), layout.recv_capacity())
             .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
         let pending = ScratchPool::try_new(layout.pending_slots(), layout.pending_capacity())
@@ -671,19 +739,24 @@ impl<R: Role> Wire for Tls<R> {
                 pending,
                 send,
             },
-            role: R::runtime(limits, config.role, &storage.role)?,
+            role,
         })
     }
 
-    fn prepare_open<'a, 'd>(runtime: &'a mut Self::RuntimeContext<'d>) -> Option<Self::Open<'a, 'd>>
+    fn prepare_open<'a, 'd>(
+        runtime: &'a mut Self::RuntimeContext<'d>,
+    ) -> Result<Option<Self::Open<'a, 'd>>, error::Error>
     where
         'd: 'a,
     {
         let (tls, send) = match runtime.retry.take() {
             Some(value) => value,
-            None => Open::new(runtime).take()?,
+            None => match Open::new(runtime).try_take()? {
+                Some(value) => value,
+                None => return Ok(None),
+            },
         };
-        Some(ReservedOpen::new(runtime, tls, send))
+        Ok(Some(ReservedOpen::new(runtime, tls, send)))
     }
 
     fn process_recv<'a, 'd>(
@@ -699,7 +772,7 @@ impl<R: Role> Wire for Tls<R> {
     fn process_retained_recv<'a, 'd>(
         wire: &mut Self::Connection<'d>,
         runtime: &mut Self::RuntimeContext<'d>,
-        mut bytes: ProvidedLease<'a>,
+        mut bytes: Lease<'a>,
     ) -> Option<Self::RetainedRecv<'a>> {
         let retained = Ingress::<R>::new(&mut wire.state, &mut runtime.role)
             .read(bytes.as_mut_slice())

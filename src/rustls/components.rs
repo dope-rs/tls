@@ -9,7 +9,7 @@ use crate::send::SendBuffer;
 pub struct RustSendState(pub(super) Buffer<Scratch>);
 
 // SAFETY: the fixed pool buffer mutates only through exclusive RustSendState access.
-unsafe impl SendStorage for RustSendState {
+impl SendStorage for RustSendState {
     fn as_slice(&self) -> &[u8] {
         self.0.as_slice()
     }

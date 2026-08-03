@@ -1,8 +1,12 @@
 mod common;
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use dope_net::wire::send::{SendStorage, Storage};
 use dope_net::wire::{OpenReservation, RuntimeLimits, Wire};
-use dope_tls::tls::{Client, Endpoint, Tls};
+use dope_tls::ClientCertSource;
+use dope_tls::tls::{Client, ClientDial, ClientSetup, ClientSource, Endpoint, Tls};
 
 type ClientTls = Tls<Client>;
 type ServerTls = Tls;
@@ -51,18 +55,122 @@ fn server_endpoint() -> Endpoint {
     .unwrap()
 }
 
+struct CountingSource {
+    setup: ClientSetup,
+    calls: Rc<Cell<usize>>,
+}
+
+impl ClientSource for CountingSource {
+    fn next(&mut self) -> ClientDial {
+        self.calls.set(self.calls.get() + 1);
+        self.setup.for_next_dial()
+    }
+}
+
 #[test]
-fn cancelled_open_preserves_once_client_setup() {
+fn cancelled_open_preserves_client_setup() {
     let storage = ClientTls::connection_storage(1).unwrap();
-    let endpoint: Endpoint<Client> = Endpoint::client(client_config());
+    let endpoint: Endpoint<Client> = Endpoint::client(client_config()).unwrap();
     let mut runtime =
         ClientTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), endpoint.bind(&storage))
             .unwrap();
 
-    drop(ClientTls::prepare_open(&mut runtime).unwrap());
+    drop(ClientTls::prepare_open(&mut runtime).unwrap().unwrap());
 
-    let (_wire, _send) = ClientTls::prepare_open(&mut runtime).unwrap().commit();
-    assert!(ClientTls::prepare_open(&mut runtime).is_none());
+    let connection = ClientTls::prepare_open(&mut runtime)
+        .unwrap()
+        .unwrap()
+        .commit();
+    assert!(ClientTls::prepare_open(&mut runtime).unwrap().is_none());
+    drop(connection);
+    assert!(ClientTls::prepare_open(&mut runtime).unwrap().is_some());
+}
+
+#[test]
+fn standard_client_setup_fills_multiple_slots_and_reopens_them() {
+    const CAPACITY: usize = 8;
+    let limits = RuntimeLimits::new(CAPACITY, 0, 64 * 1024);
+    let storage = ClientTls::connection_storage(CAPACITY).unwrap();
+    let endpoint: Endpoint<Client> = Endpoint::client(client_config()).unwrap();
+    let mut runtime = ClientTls::runtime_context(limits, endpoint.bind(&storage)).unwrap();
+
+    let mut connections = (0..CAPACITY)
+        .map(|_| {
+            ClientTls::prepare_open(&mut runtime)
+                .unwrap()
+                .unwrap()
+                .commit()
+        })
+        .collect::<Vec<_>>();
+    assert!(ClientTls::prepare_open(&mut runtime).unwrap().is_none());
+
+    drop(connections.pop());
+    let replacement = ClientTls::prepare_open(&mut runtime)
+        .unwrap()
+        .unwrap()
+        .commit();
+
+    drop((connections, replacement));
+}
+
+#[test]
+fn resource_backpressure_never_advances_the_client_source() {
+    type CountingTls = Tls<Client<CountingSource>>;
+
+    let calls = Rc::new(Cell::new(0));
+    let storage = CountingTls::connection_storage(1).unwrap();
+    let endpoint = Endpoint::client_source(CountingSource {
+        setup: ClientSetup::new(client_config()).unwrap(),
+        calls: calls.clone(),
+    });
+    let mut runtime =
+        CountingTls::runtime_context(RuntimeLimits::new(1, 0, 64 * 1024), endpoint.bind(&storage))
+            .unwrap();
+
+    let connection = CountingTls::prepare_open(&mut runtime)
+        .unwrap()
+        .unwrap()
+        .commit();
+    assert_eq!(calls.get(), 1);
+    assert!(CountingTls::prepare_open(&mut runtime).unwrap().is_none());
+    assert_eq!(calls.get(), 1);
+
+    drop(connection);
+    assert!(CountingTls::prepare_open(&mut runtime).unwrap().is_some());
+    assert_eq!(calls.get(), 2);
+}
+
+#[test]
+fn mutual_client_setup_fills_multiple_slots_and_reopens_them() {
+    const CAPACITY: usize = 8;
+    let limits = RuntimeLimits::new(CAPACITY, 0, 64 * 1024);
+    let storage = ClientTls::connection_storage(CAPACITY).unwrap();
+    let endpoint: Endpoint<Client> = Endpoint::client_mutual(
+        client_config(),
+        ClientCertSource::RawPublicKey {
+            signing_key: common::signing_key(),
+        },
+    )
+    .unwrap();
+    let mut runtime = ClientTls::runtime_context(limits, endpoint.bind(&storage)).unwrap();
+
+    let mut connections = (0..CAPACITY)
+        .map(|_| {
+            ClientTls::prepare_open(&mut runtime)
+                .unwrap()
+                .unwrap()
+                .commit()
+        })
+        .collect::<Vec<_>>();
+    assert!(ClientTls::prepare_open(&mut runtime).unwrap().is_none());
+
+    drop(connections.pop());
+    let replacement = ClientTls::prepare_open(&mut runtime)
+        .unwrap()
+        .unwrap()
+        .commit();
+
+    drop((connections, replacement));
 }
 
 #[test]
@@ -74,11 +182,17 @@ fn dropped_connection_recycles_the_runtime_side_slot() {
     )
     .unwrap();
 
-    let connection = ServerTls::prepare_open(&mut runtime).unwrap().commit();
-    assert!(ServerTls::prepare_open(&mut runtime).is_none());
+    let connection = ServerTls::prepare_open(&mut runtime)
+        .unwrap()
+        .unwrap()
+        .commit();
+    assert!(ServerTls::prepare_open(&mut runtime).unwrap().is_none());
     drop(connection);
 
-    let _reused = ServerTls::prepare_open(&mut runtime).unwrap().commit();
+    let _reused = ServerTls::prepare_open(&mut runtime)
+        .unwrap()
+        .unwrap()
+        .commit();
 }
 
 #[test]
@@ -90,7 +204,10 @@ fn committed_connection_borrows_side_storage_but_not_runtime() {
             server_endpoint().bind(&storage),
         )
         .unwrap();
-        ServerTls::prepare_open(&mut runtime).unwrap().commit()
+        ServerTls::prepare_open(&mut runtime)
+            .unwrap()
+            .unwrap()
+            .commit()
     };
 
     drop(connection);
@@ -109,6 +226,7 @@ fn opening_connections_does_not_eagerly_lease_send_or_receive_buffers() {
 
     let server = ServerTls::prepare_open(&mut server_runtime)
         .unwrap()
+        .unwrap()
         .commit();
     let server_open = server_runtime.buffer_usage();
     assert_eq!(server_open.recv_available(), 1);
@@ -116,11 +234,12 @@ fn opening_connections_does_not_eagerly_lease_send_or_receive_buffers() {
     assert_eq!(server_open.send_available(), 1);
     drop(server);
 
-    let endpoint: Endpoint<Client> = Endpoint::client(client_config());
+    let endpoint: Endpoint<Client> = Endpoint::client(client_config()).unwrap();
     let client_storage = ClientTls::connection_storage(1).unwrap();
     let mut client_runtime =
         ClientTls::runtime_context(limits, endpoint.bind(&client_storage)).unwrap();
     let client = ClientTls::prepare_open(&mut client_runtime)
+        .unwrap()
         .unwrap()
         .commit();
     let client_open = client_runtime.buffer_usage();
@@ -138,10 +257,13 @@ fn opening_connections_does_not_eagerly_lease_send_or_receive_buffers() {
 #[test]
 fn send_buffer_is_leased_exactly_until_ciphertext_completion() {
     let limits = RuntimeLimits::new(1, 0, 64 * 1024);
-    let endpoint: Endpoint<Client> = Endpoint::client(client_config());
+    let endpoint: Endpoint<Client> = Endpoint::client(client_config()).unwrap();
     let storage = ClientTls::connection_storage(1).unwrap();
     let mut runtime = ClientTls::runtime_context(limits, endpoint.bind(&storage)).unwrap();
-    let (mut wire, mut send) = ClientTls::prepare_open(&mut runtime).unwrap().commit();
+    let (mut wire, mut send) = ClientTls::prepare_open(&mut runtime)
+        .unwrap()
+        .unwrap()
+        .commit();
     assert_eq!(runtime.buffer_usage().send_available(), 1);
 
     drop(ClientTls::flush_pending(

@@ -180,7 +180,10 @@ fn dope_client(pki: &Pki, suite: CipherSuite) -> ClientState {
             enable_early_data: false,
         },
         WallClock::FixedMillis(pki.valid_at * 1000),
-        move |c| c.set_cipher_suites(&[suite]),
+        move |c| {
+            c.set_cipher_suites(&[suite])
+                .expect("new client must be configurable");
+        },
     )
     .unwrap()
 }

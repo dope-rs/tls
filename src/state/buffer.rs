@@ -47,6 +47,19 @@ impl Buffers {
         }
     }
 
+    pub(crate) fn with_pending(
+        recv_pool: ScratchPool,
+        pending_pool: ScratchPool,
+        pending: Buffer<Scratch>,
+    ) -> Self {
+        Self {
+            recv: None,
+            recv_pool,
+            pending: Some(pending),
+            pending_pool,
+        }
+    }
+
     pub(super) fn standalone() -> Result<Self, Error> {
         let pool = ScratchPool::try_new(2, TLS_STAGING_CAP)
             .map_err(|error| Error::Io(io::Error::new(ErrorKind::InvalidInput, error)))?;

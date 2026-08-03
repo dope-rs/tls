@@ -3,12 +3,13 @@ use std::io::{self, BufRead, Error, ErrorKind, IoSlice, Write};
 use std::option::IntoIter;
 use std::sync::Arc;
 
+use dope_net::wire::Lease;
 use dope_net::wire::send::{Plain, Prepared, Storage, Vectored};
 use dope_net::wire::{
     ReadyOpen, Reclaim, RecvChunk, RuntimeLimits, Wire,
     buffered::{Buffer, Buffered, Recv, Scratch},
 };
-use dope_net::{Bytes, Leased, ProvidedLease, Retained};
+use dope_net::{Bytes, Leased, Retained};
 use rustls::{
     ClientConfig, ClientConnection, Connection, ServerConfig, ServerConnection,
     pki_types::ServerName,
@@ -374,6 +375,7 @@ impl Wire for RustTls {
         = ReadyOpen<Self::Connection<'d>, Self::SendStorage>
     where
         'd: 'a;
+    type OpenError = rustls::Error;
     type Recv<'a> = Bytes<Leased>;
     type RecvBatch<'a> = IntoIter<RecvChunk<'a, Self::Recv<'a>>>;
     type RetainedRecv<'d> = Bytes<Retained>;
@@ -407,40 +409,44 @@ impl Wire for RustTls {
         })
     }
 
-    fn prepare_open<'a, 'd>(runtime: &'a mut Self::RuntimeContext<'d>) -> Option<Self::Open<'a, 'd>>
+    fn prepare_open<'a, 'd>(
+        runtime: &'a mut Self::RuntimeContext<'d>,
+    ) -> Result<Option<Self::Open<'a, 'd>>, rustls::Error>
     where
         'd: 'a,
     {
-        let send = RustSendState(runtime.buffers.try_acquire_scratch()?);
+        let Some(send) = runtime.buffers.try_acquire_scratch() else {
+            return Ok(None);
+        };
+        let send = RustSendState(send);
         let mut s = ConnectionState::empty();
         let (conn, max_plaintext) = match &runtime.endpoint {
             RustTlsEndpoint::Server(c) => (
-                ServerConnection::new(c.clone())
-                    .ok()
-                    .map(Connection::Server),
+                Some(Connection::Server(ServerConnection::new(c.clone())?)),
                 Self::plaintext_limit(c.max_fragment_size),
             ),
             RustTlsEndpoint::Client {
                 config,
                 server_name,
             } => (
-                ClientConnection::new(config.clone(), server_name.clone())
-                    .ok()
-                    .map(Connection::Client),
+                Some(Connection::Client(ClientConnection::new(
+                    config.clone(),
+                    server_name.clone(),
+                )?)),
                 Self::plaintext_limit(config.max_fragment_size),
             ),
             RustTlsEndpoint::None => (None, TLS_MAX_PLAINTEXT),
         };
         s.close = conn.is_none();
         s.conn = conn;
-        Some(ReadyOpen::new(
+        Ok(Some(ReadyOpen::new(
             Self {
                 state: s,
                 send_inflight: false,
                 max_plaintext,
             },
             send,
-        ))
+        )))
     }
 
     fn process_recv<'a, 'd>(
@@ -462,7 +468,7 @@ impl Wire for RustTls {
     fn process_retained_recv<'a, 'd>(
         wire: &mut Self::Connection<'d>,
         runtime: &mut Self::RuntimeContext<'d>,
-        bytes: ProvidedLease<'a>,
+        bytes: Lease<'a>,
     ) -> Option<Self::RetainedRecv<'a>> {
         let Some(mut data) = runtime.buffers.try_acquire_recv() else {
             wire.state.close = true;
