@@ -1,19 +1,20 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time;
 
-use shin::connection::Clock;
+use shin::connection;
 
 #[derive(Debug, Clone, Copy)]
-pub enum WallClock {
+pub enum Clock {
     System,
     FixedMillis(u64),
 }
 
-impl Clock for WallClock {
+impl connection::Clock for Clock {
     fn now_ms(&self) -> u64 {
         match self {
-            Self::System => SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_millis() as u64),
+            Self::System => match time::SystemTime::now().duration_since(time::UNIX_EPOCH) {
+                Ok(duration) => duration.as_millis() as u64,
+                Err(_) => 0,
+            },
             Self::FixedMillis(milliseconds) => *milliseconds,
         }
     }

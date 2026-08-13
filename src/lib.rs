@@ -1,13 +1,16 @@
-pub mod clock;
-pub mod error;
-pub mod roots;
-mod send;
+mod clock;
+mod error;
+mod roots;
 mod staging;
 pub mod state;
 pub mod tls;
+mod transmissions;
 
-#[cfg(feature = "rustls")]
-pub mod rustls;
-
-pub use shin::client::config::ClientCertSource;
-pub use shin::server::{config::ClientAuth, config::ClientCertVerifier, config::ClientIdentity};
+pub use clock::Clock;
+pub use error::Error;
+pub use roots::Roots;
+pub use shin::client::config::Identity;
+pub use shin::server::{
+    config::ClientAuth, config::ClientAuthVerifier, config::ClientCertVerifier,
+    config::ClientIdentity,
+};

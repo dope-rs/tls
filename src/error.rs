@@ -1,23 +1,21 @@
 use std::{error, fmt, io};
 
-use shin::client::config;
+use shin::client::{config, workspace};
 use shin::connection;
-use shin::wire::{
-    alert::AlertDescription,
-    record::{RecordError, RecordKeyError},
-};
+use shin::wire::{alert, record};
 
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    InvalidConfig(config::ConfigError),
+    InvalidConfig(config::Error),
+    InvalidWorkspace(workspace::Mismatch),
     Handshake(connection::Error),
-    Record(RecordError),
-    RecordKey(RecordKeyError),
+    Record(record::Error),
+    RecordKey(record::KeyError),
     UnexpectedRecord,
     NotEstablished,
     Io(io::Error),
-    PeerAlert(AlertDescription),
+    PeerAlert(alert::Description),
     MalformedAlert,
     Truncated,
     ReceiveOverflow,
@@ -27,14 +25,14 @@ pub enum Error {
     EarlyDataUnsupported,
 }
 
-impl From<RecordError> for Error {
-    fn from(error: RecordError) -> Self {
+impl From<record::Error> for Error {
+    fn from(error: record::Error) -> Self {
         Self::Record(error)
     }
 }
 
-impl From<RecordKeyError> for Error {
-    fn from(error: RecordKeyError) -> Self {
+impl From<record::KeyError> for Error {
+    fn from(error: record::KeyError) -> Self {
         Self::RecordKey(error)
     }
 }
@@ -58,6 +56,7 @@ impl PartialEq for Error {
             | (Self::MalformedAlert, Self::MalformedAlert)
             | (Self::Truncated, Self::Truncated) => true,
             (Self::InvalidConfig(a), Self::InvalidConfig(b)) => a == b,
+            (Self::InvalidWorkspace(a), Self::InvalidWorkspace(b)) => a == b,
             (Self::Handshake(a), Self::Handshake(b)) => a == b,
             (Self::Record(a), Self::Record(b)) => a == b,
             (Self::RecordKey(a), Self::RecordKey(b)) => a == b,
@@ -72,6 +71,7 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(error) => write!(formatter, "invalid TLS client config: {error}"),
+            Self::InvalidWorkspace(error) => write!(formatter, "invalid TLS workspace: {error}"),
             Self::Handshake(error) => write!(formatter, "TLS handshake failed: {error:?}"),
             Self::Record(error) => write!(formatter, "TLS record failed: {error:?}"),
             Self::RecordKey(error) => write!(formatter, "TLS record key failed: {error:?}"),
@@ -94,8 +94,15 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::InvalidConfig(error) => Some(error),
+            Self::InvalidWorkspace(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<workspace::Mismatch> for Error {
+    fn from(error: workspace::Mismatch) -> Self {
+        Self::InvalidWorkspace(error)
     }
 }

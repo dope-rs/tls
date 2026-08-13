@@ -1,28 +1,34 @@
-use std::iter::FusedIterator;
+use std::iter;
 
-use shin::client::config::OwnedTrustAnchor;
+use shin::client::config;
 
 #[derive(Clone, Debug, Default)]
-pub struct WebPkiRoots {
+pub struct Roots {
     index: usize,
 }
 
-impl WebPkiRoots {
+impl Roots {
     pub const fn new() -> Self {
         Self { index: 0 }
     }
+
+    /// Builds a validated issuer-indexed store that can be shared by endpoints.
+    pub fn into_store(self) -> Result<config::TrustStore, config::Error> {
+        config::TrustStore::new(self)
+    }
 }
 
-impl Iterator for WebPkiRoots {
-    type Item = OwnedTrustAnchor;
+impl Iterator for Roots {
+    type Item = config::OwnedTrustAnchor;
 
     fn next(&mut self) -> Option<Self::Item> {
         let anchor = webpki_roots::TLS_SERVER_ROOTS.get(self.index)?;
         self.index += 1;
-        Some(OwnedTrustAnchor {
-            subject_der: anchor.subject.as_ref().to_vec(),
-            spki_der: wrap_sequence(anchor.subject_public_key_info.as_ref()),
-        })
+        Some(config::OwnedTrustAnchor::from_der_fields(
+            anchor.subject.as_ref(),
+            anchor.subject_public_key_info.as_ref(),
+            anchor.name_constraints.as_ref().map(|value| value.as_ref()),
+        ))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -31,29 +37,5 @@ impl Iterator for WebPkiRoots {
     }
 }
 
-impl ExactSizeIterator for WebPkiRoots {}
-impl FusedIterator for WebPkiRoots {}
-
-fn wrap_sequence(inner: &[u8]) -> Vec<u8> {
-    let bytes = inner.len().to_be_bytes();
-    let start = bytes
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(bytes.len() - 1);
-    let length = &bytes[start..];
-    let header_len = if inner.len() < 128 {
-        2
-    } else {
-        2 + length.len()
-    };
-    let mut out = Vec::with_capacity(header_len + inner.len());
-    out.push(0x30);
-    if inner.len() < 128 {
-        out.push(inner.len() as u8);
-    } else {
-        out.push(0x80 | length.len() as u8);
-        out.extend_from_slice(length);
-    }
-    out.extend_from_slice(inner);
-    out
-}
+impl ExactSizeIterator for Roots {}
+impl iter::FusedIterator for Roots {}

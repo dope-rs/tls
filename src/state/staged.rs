@@ -1,25 +1,56 @@
-use shin::connection::{DriveError, Epoch};
-use shin::wire::record::{HEADER_LEN, RecordError};
+use std::mem;
 
-use super::State;
-use super::record::{RecordAction, RecordEvents, RecordFailure, RecordFrame, ReportFailure};
-use super::sessions::Session;
-use crate::error::Error;
-use dope_net::{Bytes, Retained};
+use o3::buffer::bytes;
+use shin::{connection, wire::record};
 
-pub(super) struct WireRead {
-    pub(super) consumed: usize,
-    pub(super) chunk: Option<Bytes<Retained>>,
-    pub(super) keep_reading: bool,
-    pub(super) ok: bool,
+use crate::error;
+use crate::state::Internals as _;
+use crate::state::api::capabilities::Status as _;
+use crate::state::records::events;
+use crate::state::{self, records, sessions, status};
+
+#[doc(hidden)]
+#[must_use]
+pub struct WireRead<'d> {
+    consumed: usize,
+    chunk: Option<bytes::Bytes<bytes::Pooled<'d>>>,
+    status: status::Read,
 }
 
-pub(super) struct Staged<'a, S: Session> {
-    state: &'a mut State<S>,
+const _: () = assert!(
+    mem::size_of::<WireRead<'static>>()
+        <= mem::size_of::<(
+            usize,
+            Option<bytes::Bytes<bytes::Pooled<'static>>>,
+            bool,
+            bool,
+        )>()
+);
+
+impl<'d> WireRead<'d> {
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    pub fn status(&self) -> status::Read {
+        self.status
+    }
+
+    pub fn into_chunk(self) -> Option<bytes::Bytes<bytes::Pooled<'d>>> {
+        self.chunk
+    }
+
+    pub(crate) fn fail(&mut self) {
+        self.status = status::Read::Failed;
+    }
 }
 
-impl<'a, S: Session> Staged<'a, S> {
-    pub(super) fn new(state: &'a mut State<S>) -> Self {
+pub(crate) struct Reader<'a, 'd, S: sessions::Peer> {
+    state: &'a mut state::State<'d, S>,
+}
+
+impl<'a, 'd, S: sessions::Peer> Reader<'a, 'd, S> {
+    pub(crate) fn new(state: &'a mut state::State<'d, S>) -> Self {
         Self { state }
     }
 
@@ -28,52 +59,50 @@ impl<'a, S: Session> Staged<'a, S> {
         bytes: &[u8],
         read: &mut impl FnMut(
             &mut S,
-            Epoch,
+            connection::Epoch,
             &[u8],
-            &mut RecordEvents<'_>,
-        ) -> Result<(), DriveError<RecordFailure>>,
+            &mut events::RecordEvents<'_, '_>,
+        ) -> Result<(), connection::DriveError<records::RecordFailure>>,
         receive: &mut impl FnMut(&[u8]),
-    ) -> Result<(), Error> {
+    ) -> Result<(), error::Error> {
         let mut rest = bytes;
         loop {
             let take = self
                 .state
                 .buffers
                 .append_recv(rest)
-                .map_err(|_| Error::ReceiveOverflow)?;
+                .map_err(|_| error::Error::ReceiveOverflow)?;
             rest = &rest[take..];
-            while self.consume_one_record(read, receive)? {}
+            while self.consume_one_record(read, receive)? == records::Control::Continue {}
             if rest.is_empty() {
                 return Ok(());
             }
             if take == 0 {
-                return Err(Error::Record(RecordError::BodyTooLarge));
+                return Err(error::Error::Record(record::Error::BodyTooLarge));
             }
         }
     }
 
-    pub(super) fn read_one_wire(
+    pub(crate) fn read_one_wire(
         &mut self,
         bytes: &[u8],
         read: &mut impl FnMut(
             &mut S,
-            Epoch,
+            connection::Epoch,
             &[u8],
-            &mut RecordEvents<'_>,
-        ) -> Result<(), DriveError<RecordFailure>>,
-    ) -> WireRead {
+            &mut events::RecordEvents<'_, '_>,
+        ) -> Result<(), connection::DriveError<records::RecordFailure>>,
+    ) -> WireRead<'d> {
         match self.read_one_wire_result(bytes, read) {
-            Ok((consumed, chunk, keep_reading)) => WireRead {
+            Ok((consumed, chunk, control)) => WireRead {
                 consumed,
                 chunk,
-                keep_reading,
-                ok: true,
+                status: control.status(),
             },
             Err(_) => WireRead {
                 consumed: bytes.len(),
                 chunk: None,
-                keep_reading: false,
-                ok: false,
+                status: status::Read::Failed,
             },
         }
     }
@@ -83,26 +112,33 @@ impl<'a, S: Session> Staged<'a, S> {
         bytes: &[u8],
         read: &mut impl FnMut(
             &mut S,
-            Epoch,
+            connection::Epoch,
             &[u8],
-            &mut RecordEvents<'_>,
-        ) -> Result<(), DriveError<RecordFailure>>,
-    ) -> Result<(usize, Option<Bytes<Retained>>, bool), Error> {
+            &mut events::RecordEvents<'_, '_>,
+        ) -> Result<(), connection::DriveError<records::RecordFailure>>,
+    ) -> Result<
+        (
+            usize,
+            Option<bytes::Bytes<bytes::Pooled<'d>>>,
+            records::Control,
+        ),
+        error::Error,
+    > {
         let mut consumed = 0;
-        if self.state.buffers.recv().len() < HEADER_LEN {
-            let needed = HEADER_LEN - self.state.buffers.recv().len();
+        if self.state.buffers.recv().len() < record::HEADER_LEN {
+            let needed = record::HEADER_LEN - self.state.buffers.recv().len();
             let take = needed.min(bytes.len());
             self.state
                 .buffers
                 .append_recv(&bytes[..take])
-                .map_err(|_| Error::ReceiveOverflow)?;
+                .map_err(|_| error::Error::ReceiveOverflow)?;
             consumed += take;
-            if self.state.buffers.recv().len() < HEADER_LEN {
-                return Ok((consumed, None, true));
+            if self.state.buffers.recv().len() < record::HEADER_LEN {
+                return Ok((consumed, None, records::Control::Continue));
             }
         }
-        let Some(frame) = RecordFrame::parse(self.state.buffers.recv())? else {
-            return Ok((consumed, None, true));
+        let Some(frame) = records::RecordFrame::parse(self.state.buffers.recv())? else {
+            return Ok((consumed, None, records::Control::Continue));
         };
         let total = frame.len();
         if self.state.buffers.recv().len() < total {
@@ -111,32 +147,32 @@ impl<'a, S: Session> Staged<'a, S> {
             self.state
                 .buffers
                 .append_recv(&bytes[consumed..consumed + take])
-                .map_err(|_| Error::ReceiveOverflow)?;
+                .map_err(|_| error::Error::ReceiveOverflow)?;
             consumed += take;
             if self.state.buffers.recv().len() < total {
-                return Ok((consumed, None, true));
+                return Ok((consumed, None, records::Control::Continue));
             }
         }
         let action = self.handle_record(total, read)?;
-        let (chunk, keep_reading) = self.finish_wire_record(total, action)?;
-        Ok((consumed, chunk, keep_reading))
+        let (chunk, control) = self.finish_wire_record(total, action)?;
+        Ok((consumed, chunk, control))
     }
 
     fn consume_one_record(
         &mut self,
         read: &mut impl FnMut(
             &mut S,
-            Epoch,
+            connection::Epoch,
             &[u8],
-            &mut RecordEvents<'_>,
-        ) -> Result<(), DriveError<RecordFailure>>,
+            &mut events::RecordEvents<'_, '_>,
+        ) -> Result<(), connection::DriveError<records::RecordFailure>>,
         receive: &mut impl FnMut(&[u8]),
-    ) -> Result<bool, Error> {
+    ) -> Result<records::Control, error::Error> {
         if self.state.is_closed() {
-            return Ok(false);
+            return Ok(records::Control::Stop);
         }
-        let Some(frame) = RecordFrame::complete(self.state.buffers.recv())? else {
-            return Ok(false);
+        let Some(frame) = records::RecordFrame::complete(self.state.buffers.recv())? else {
+            return Ok(records::Control::Stop);
         };
         let total = frame.len();
         let action = self.handle_record(total, read)?;
@@ -148,62 +184,63 @@ impl<'a, S: Session> Staged<'a, S> {
         total: usize,
         read: &mut impl FnMut(
             &mut S,
-            Epoch,
+            connection::Epoch,
             &[u8],
-            &mut RecordEvents<'_>,
-        ) -> Result<(), DriveError<RecordFailure>>,
-    ) -> Result<RecordAction, Error> {
-        let State {
+            &mut events::RecordEvents<'_, '_>,
+        ) -> Result<(), connection::DriveError<records::RecordFailure>>,
+    ) -> Result<records::RecordAction, error::Error> {
+        let state::State {
             record: state,
             phase,
             buffers,
+            control,
             peer_close,
         } = &mut *self.state;
         let (record, pending) = buffers.recv_record_and_pending(total)?;
-        state.handle::<ReportFailure>(phase, peer_close, pending, record, read)
+        state.handle::<records::ReportFailure>(phase, peer_close, control, pending, record, read)
     }
 
     fn finish_record(
         &mut self,
         total: usize,
-        action: RecordAction,
+        action: records::RecordAction,
         receive: &mut impl FnMut(&[u8]),
-    ) -> Result<bool, Error> {
-        let keep_reading = match action {
-            RecordAction::Application(plaintext_len) => {
-                let range = HEADER_LEN..HEADER_LEN + plaintext_len;
+    ) -> Result<records::Control, error::Error> {
+        let control = match action {
+            records::RecordAction::Application(plaintext_len) => {
+                let range = record::HEADER_LEN..record::HEADER_LEN + plaintext_len;
                 if !range.is_empty() {
                     receive(&self.state.buffers.recv()[range]);
                 }
-                true
+                records::Control::Continue
             }
-            RecordAction::Control(keep_reading) => keep_reading,
+            records::RecordAction::Control(control) => control,
         };
         if !self.state.buffers.try_consume_recv(total) {
-            return Err(Error::InvalidBufferProgress);
+            return Err(error::Error::InvalidBufferProgress);
         }
-        Ok(keep_reading)
+        Ok(control)
     }
 
     fn finish_wire_record(
         &mut self,
         total: usize,
-        action: RecordAction,
-    ) -> Result<(Option<Bytes<Retained>>, bool), Error> {
+        action: records::RecordAction,
+    ) -> Result<(Option<bytes::Bytes<bytes::Pooled<'d>>>, records::Control), error::Error> {
         match action {
-            RecordAction::Application(plaintext_len) => {
-                let range = HEADER_LEN..HEADER_LEN + plaintext_len;
+            records::RecordAction::Application(plaintext_len) => {
+                let range = record::HEADER_LEN..record::HEADER_LEN + plaintext_len;
                 let empty = range.is_empty();
                 let Some(chunk) = self.state.buffers.take_recv_range(range) else {
-                    return self.state.fatal_overflow().map(|keep| (None, keep));
+                    return Err(self.state.fatal_overflow());
                 };
-                Ok(((!empty).then_some(chunk), true))
+                Ok(((!empty).then_some(chunk), records::Control::Continue))
             }
-            RecordAction::Control(keep_reading) => {
+            records::RecordAction::Control(control) => {
                 if !self.state.buffers.try_consume_recv(total) {
-                    return Err(Error::InvalidBufferProgress);
+                    return Err(error::Error::InvalidBufferProgress);
                 }
-                Ok((None, keep_reading))
+                Ok((None, control))
             }
         }
     }
