@@ -1,16 +1,9 @@
-mod clock;
+pub mod config;
 mod error;
-mod roots;
+pub mod roots;
 mod staging;
-pub mod state;
+mod state;
 pub mod tls;
-mod transmissions;
 
-pub use clock::Clock;
 pub use error::Error;
-pub use roots::Roots;
-pub use shin::client::config::Identity;
-pub use shin::server::{
-    config::ClientAuth, config::ClientAuthVerifier, config::ClientCertVerifier,
-    config::ClientIdentity,
-};
+pub use rustls;

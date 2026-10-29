@@ -1,22 +1,27 @@
 [package]
 name = "dope-tls"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
-rust-version = "1.95"
-description = "TCP TLS streams for dope runtime, shin-backed"
+rust-version = "1.98"
+description = "TCP TLS streams for dope runtime, rustls-backed"
 license = "MIT"
 repository = "https://github.com/dope-rs/tls"
 readme = "README.md"
 
+[lib]
+test = false
+
 [dependencies]
-shin = "0.17"
-dope = "0.15"
-o3 = "=0.16.3"
-webpki-roots = "1.0"
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
+dope = "0.20.0"
+o3 = "=0.20.0"
+webpki-roots = "1.0.10"
 
 [dev-dependencies]
-ring = "0.17"
-rcgen = "0.14"
-dope-fiber = "0.15"
-dope-gen = "0.15"
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+dope-fiber = "0.20.0"
+dope-test = "0.20.0"
 pin-project = "1"
+
+[profile.release]
+panic = "abort"

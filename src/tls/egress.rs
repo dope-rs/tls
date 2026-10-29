@@ -1,113 +1,115 @@
-use dope::net::wire::send;
-use o3::buffer::pool;
-use shin::wire::{alert, record};
-
-use crate::state::Internals as _;
-use crate::state::api::capabilities::Status as _;
-use crate::state::status;
 use crate::tls::roles;
-use crate::{staging, tls, transmissions};
+use crate::{staging, tls};
+use dope::core::driver::route;
+use dope::{
+    core::io::transfer::{self, progress::Bytes},
+    net::wire::{send, terminal},
+};
+use o3::{buffer::pool, depot::array};
+use send::progress;
+use std::io::{self, Write as _};
 
-pub(super) struct Egress<'a, 'd, R: roles::Protocol, const ID: u8> {
+pub(super) struct Egress<'a, 'd, R: roles::Protocol + 'd, ID: route::Identity + 'd> {
     wire: &'a mut tls::Connection<'d, R, ID>,
 }
-
-impl<'a, 'd, R: roles::Protocol, const ID: u8> Egress<'a, 'd, R, ID> {
+impl<'a, 'd, R: roles::Protocol + 'd, ID: route::Identity + 'd> Egress<'a, 'd, R, ID> {
     pub(super) fn new(wire: &'a mut tls::Connection<'d, R, ID>) -> Self {
         Self { wire }
     }
 
-    pub(super) fn encrypt(&mut self, output: &mut pool::BorrowedCursor<'d>, plain: &[u8]) -> usize {
-        if self.wire.send_inflight {
-            return 0;
-        }
-        if !self.established() {
-            return 0;
-        }
-        let mut consumed = 0;
-        while consumed < plain.len() {
-            let end = (consumed + record::MAX_PLAINTEXT_BODY).min(plain.len());
-            if !Self::record_fits(output, end - consumed) {
-                break;
-            }
-            let count = self.seal_record(output, &plain[consumed..end]);
-            if count == 0 {
-                break;
-            }
-            consumed += count;
-        }
-        consumed
-    }
-
-    pub(super) fn encrypt_vectored(
+    pub(super) fn encrypt(
         &mut self,
-        output: &mut pool::BorrowedCursor<'d>,
-        vectored: &send::Vectored<'_>,
-    ) -> usize {
-        if self.wire.send_inflight {
-            return 0;
+        output: &mut pool::Cursor<pool::Layout, pool::Borrowed<'d>>,
+        mut plain: progress::Input<'_, Bytes<'_>>,
+        end: terminal::Send<'_, terminal::Error<'d, tls::Tls<R>>>,
+    ) -> terminal::Processed<()> {
+        if self.wire.send_inflight || !self.wire.can_write() {
+            return end.output(());
         }
-        if !self.established() {
-            return 0;
-        }
-        let total = vectored.bytes();
-        let mut cursor = transmissions::VectoredCursor::new(vectored.iter());
-        let mut consumed = 0;
-        while consumed < total {
-            let record_len = (total - consumed).min(record::MAX_PLAINTEXT_BODY);
-            if !Self::record_fits(output, record_len) {
-                break;
-            }
-            let tls = &mut self.wire.state.tls;
-            match tls.write_app_parts_into(output, record_len, cursor.take(record_len)) {
-                Ok(0) => return consumed,
-                Ok(count) => consumed += count,
-                Err(_) => {
-                    self.wire.state.close = true;
-                    return consumed;
+        while !plain.is_empty() && output.spare_len() != 0 && !self.wire.has_debt() {
+            let part = plain.take(transfer::Len::fixed::<{ staging::MAX_PLAINTEXT }>());
+            let n = match self.wire.native.writer().write(part.as_slice()) {
+                Ok(n) => n,
+                Err(cause) => {
+                    drop(part);
+                    return self.fail(end, crate::Error::Io(cause));
+                }
+            };
+            if n == part.as_slice().len() {
+                part.commit();
+            } else {
+                let used = transfer::Len::prefix(n, part.amount());
+                drop(part);
+                if !used.is_zero() {
+                    plain.take(used).commit();
                 }
             }
-        }
-        debug_assert_eq!(cursor.consumed(), consumed);
-        consumed
-    }
-
-    pub(super) fn propagate_close(&self) -> bool {
-        !self.wire.state.tls.has_pending_control()
-            && (self.wire.state.close
-                || self.wire.state.tls.peer_close() == status::PeerClose::CloseNotify)
-    }
-
-    pub(super) fn seal_close_notify(&mut self, output: &mut pool::BorrowedCursor<'d>) {
-        if self.wire.state.close || self.wire.state.close_notify_sent {
-            return;
-        }
-        let tls = &mut self.wire.state.tls;
-        let sealed = tls.can_close_notify()
-            && tls
-                .seal_closing_alert_into(output, alert::Alert::close_notify())
-                .is_ok();
-        if sealed {
-            self.wire.state.close_notify_sent = true;
-        }
-    }
-
-    fn established(&self) -> bool {
-        self.wire.state.tls.is_established()
-    }
-
-    fn record_fits(output: &pool::BorrowedCursor<'_>, plaintext_len: usize) -> bool {
-        output.spare_capacity() >= plaintext_len + staging::TLS13_RECORD_OVERHEAD
-    }
-
-    fn seal_record(&mut self, output: &mut pool::BorrowedCursor<'d>, chunk: &[u8]) -> usize {
-        let tls = &mut self.wire.state.tls;
-        match tls.write_app_into(output, chunk) {
-            Ok(count) => count,
-            Err(_) => {
-                self.wire.state.close = true;
-                0
+            if let Some(cause) = self.wire.drain(output) {
+                return self.fail(end, cause);
+            }
+            if n == 0 {
+                break;
             }
         }
+        end.output(())
+    }
+
+    /// Encrypts an exact prefix using its retained bound of at most N descriptors.
+    pub(super) fn encrypt_many<const N: usize>(
+        &mut self,
+        output: &mut pool::Cursor<pool::Layout, pool::Borrowed<'d>>,
+        mut plain: progress::Input<'_, progress::Vectored<'_, N>>,
+        end: terminal::Send<'_, terminal::Error<'d, tls::Tls<R>>>,
+    ) -> terminal::Processed<()> {
+        if self.wire.send_inflight || !self.wire.can_write() {
+            return end.output(());
+        }
+        while !plain.is_empty() && output.spare_len() != 0 && !self.wire.has_debt() {
+            let mut parts = plain.take(transfer::Len::fixed::<{ staging::MAX_PLAINTEXT }>());
+            let limit = parts.amount();
+            let mut slices = array::Vec::<io::IoSlice<'_>, N>::new();
+            let mut chunks = parts.take();
+            while let Some(slot) = slices.vacancy() {
+                let Some(chunk) = chunks.next() else {
+                    break;
+                };
+                let bytes = chunk.bytes();
+                slot.insert(io::IoSlice::new(bytes));
+            }
+            let n = match self.wire.native.writer().write_vectored(slices.as_slice()) {
+                Ok(n) => n,
+                Err(cause) => return self.fail(end, crate::Error::Io(cause)),
+            };
+            if n == limit.into_raw() {
+                parts.commit();
+            } else {
+                let used = transfer::Len::prefix(n, limit);
+                drop(parts);
+                if !used.is_zero() {
+                    let mut prefix = plain.take(used);
+                    for _ in prefix.take() {}
+                    prefix.commit();
+                }
+            }
+            if let Some(cause) = self.wire.drain(output) {
+                return self.fail(end, cause);
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        end.output(())
+    }
+
+    fn fail(
+        &mut self,
+        end: terminal::Send<'_, terminal::Error<'d, tls::Tls<R>>>,
+        cause: crate::Error,
+    ) -> terminal::Processed<()> {
+        self.wire.failed = true;
+        end.terminal(
+            (),
+            terminal::Terminal::Failed(terminal::Error::from_cause(cause)),
+        )
     }
 }

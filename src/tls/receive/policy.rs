@@ -1,204 +1,229 @@
+use crate::error;
+use crate::state::buffers;
+use crate::tls::{
+    self, endpoint,
+    receive::{Ingress, waiters},
+    roles,
+};
+use dope::core::driver::{
+    receive::credit,
+    route::{self, table::conn},
+};
+use dope::net::wire::{receive::reserve, send, terminal};
+use o3::depot::queue::tagged::entry;
 use std::marker;
 
-use dope::core::io::recv;
-use dope::net::wire::{self, batch, receive};
-
-use crate::state;
-use crate::state::api::capabilities::Status as _;
-use crate::tls::{self, endpoints, receive::waiters, roles};
-use crate::transmissions;
-
-pub struct Blocked<'a, 'd, R: roles::Protocol, const ID: u8> {
-    runtime: &'a mut endpoints::Runtime<'d, R, ID>,
-    resource: waiters::Resource,
+pub struct Blocked<'a, 'd, ID: route::Identity> {
+    waiters: &'a mut waiters::Queue<'d, ID>,
+    kind: waiters::Resource,
 }
-
 pub struct Policy<R>(marker::PhantomData<fn() -> R>);
 
-pub enum Transaction<'a, 'd, R: roles::Protocol, const ID: u8> {
-    Handshake(Handshake<'a, 'd, R, ID>),
-    Established(Established<'a, 'd, R, ID>),
+/// Holds the admitted receive slot and any handshake output loan through processing.
+pub struct Transaction<
+    'a,
+    'w,
+    'd,
+    R: roles::Protocol + 'w,
+    ID: route::Identity + 'w,
+    S = buffers::Reserve<'w>,
+> where
+    'd: 'w,
+{
+    wire: &'a mut tls::Connection<'w, R, ID>,
+    send: Option<tls::Buffered<'a, 'w>>,
+    run: &'a mut endpoint::Runtime<'w, 'd, R, ID>,
+    recv: S,
 }
 
-pub struct Handshake<'a, 'd, R: roles::Protocol, const ID: u8> {
-    wire: &'a mut tls::Connection<'d, R, ID>,
-    send: &'a mut tls::SendState<'d>,
-    runtime: &'a mut endpoints::Runtime<'d, R, ID>,
-}
-
-pub struct Established<'a, 'd, R: roles::Protocol, const ID: u8> {
-    wire: &'a mut tls::Connection<'d, R, ID>,
-    runtime: &'a mut endpoints::Runtime<'d, R, ID>,
-}
-
-impl<R: roles::Protocol> receive::Strategy<tls::Tls<R>> for Policy<R> {
-    type Block<'a, 'd, const ID: u8>
-        = Blocked<'a, 'd, R, ID>
-    where
-        R: 'd,
-        'd: 'a;
-    type Transaction<'a, 'd, const ID: u8>
-        = Transaction<'a, 'd, R, ID>
-    where
-        R: 'd,
-        'd: 'a;
-
-    const BACKPRESSURE: bool = true;
-
-    fn reserve<'a, 'd, const ID: u8>(
-        wire: &'a mut tls::Connection<'d, R, ID>,
-        send: &'a mut tls::SendState<'d>,
-        runtime: &'a mut endpoints::Runtime<'d, R, ID>,
-    ) -> Result<Self::Transaction<'a, 'd, ID>, Self::Block<'a, 'd, ID>>
-    where
-        R: 'd,
-        'd: 'a,
-    {
-        let handshaking = wire.state.tls.is_handshaking();
-        if handshaking && wire.send_inflight {
-            return Err(Blocked {
-                runtime,
-                resource: waiters::Resource::HandshakeEgress,
-            });
-        }
-        if !state::Internals::reserve_recv_buffer(&mut wire.state.tls) {
-            return Err(Blocked {
-                runtime,
-                resource: waiters::Resource::Recv,
-            });
-        }
-        if !handshaking {
-            return Ok(Transaction::Established(Established { wire, runtime }));
-        }
-        let send_pool = state::Internals::pending_pool(&wire.state.tls);
-        if !send.reserve(send_pool) {
-            if state::Internals::release_empty_recv_buffer(&mut wire.state.tls) {
-                runtime.waiters.wake(waiters::Resource::Recv);
-            }
-            return Err(Blocked {
-                runtime,
-                resource: waiters::Resource::HandshakeEgress,
-            });
-        }
-
-        state::Internals::swap_pending_buffer(&mut wire.state.tls, &mut send.buffer);
-        Ok(Transaction::Handshake(Handshake {
+impl<'a, 'w, 'd, R: roles::Protocol + 'w, ID: route::Identity + 'w> Transaction<'a, 'w, 'd, R, ID>
+where
+    'd: 'w,
+{
+    pub(in crate::tls) fn read<T>(
+        self,
+        read: impl FnOnce(Ingress<'_, 'w, R, ID>) -> (T, Result<(), error::Error>, buffers::Release),
+    ) -> (
+        Transaction<'a, 'w, 'd, R, ID, buffers::Release>,
+        T,
+        Result<(), error::Error>,
+    ) {
+        let Self {
             wire,
             send,
-            runtime,
-        }))
-    }
-
-    fn cancel<'d, const ID: u8>(
-        runtime: &mut endpoints::Runtime<'d, R, ID>,
-        target: wire::RecvCreditId<'d, ID>,
-    ) where
-        R: 'd,
-    {
-        runtime.waiters.cancel(target);
-    }
-
-    fn recv_released<'d, const ID: u8>(runtime: &mut endpoints::Runtime<'d, R, ID>)
-    where
-        R: 'd,
-    {
-        runtime.waiters.wake(waiters::Resource::Recv);
-    }
-
-    fn send_released<'d, const ID: u8>(runtime: &mut endpoints::Runtime<'d, R, ID>)
-    where
-        R: 'd,
-    {
-        runtime.waiters.wake(waiters::Resource::HandshakeEgress);
+            run,
+            recv,
+        } = self;
+        let (output, result, recv) = read(Ingress::new(wire, recv));
+        (
+            Transaction {
+                wire,
+                send,
+                run,
+                recv,
+            },
+            output,
+            result,
+        )
     }
 }
 
-impl<'a, 'd, R: roles::Protocol + 'd, const ID: u8> receive::Wait<'d, ID, tls::Tls<R>>
-    for Blocked<'a, 'd, R, ID>
+impl<'w, 'd, R: roles::Protocol + 'w, ID: route::Identity + 'w>
+    Transaction<'_, 'w, 'd, R, ID, buffers::Release>
+where
+    'd: 'w,
+{
+    pub(in crate::tls) fn is_peer_done(&self) -> bool {
+        self.wire.peer_closed
+    }
+
+    pub(in crate::tls) fn finish(&mut self) -> Result<(), error::Error> {
+        if let Some(send) = self.send.as_mut() {
+            self.wire.emit_into(send.buffer_mut())?;
+        }
+        Ok(())
+    }
+}
+
+impl<'w, 'd, R: roles::Protocol + 'w, ID: route::Identity + 'w, S> Transaction<'_, 'w, 'd, R, ID, S>
+where
+    'd: 'w,
+{
+    fn release(self, recv: buffers::Release) {
+        drop(self.recv);
+        if recv == buffers::Release::Released {
+            self.run.waiters.wake(waiters::Resource::Recv);
+        }
+        if self
+            .send
+            .is_some_and(|send| send.complete() == send::Availability::Released)
+        {
+            self.run.waiters.wake(waiters::Resource::HandshakeEgress);
+        }
+    }
+}
+
+impl<'w, 'd, R: roles::Protocol + 'w, ID: route::Identity + 'w> reserve::Completion
+    for Transaction<'_, 'w, 'd, R, ID>
+where
+    'd: 'w,
+{
+    fn complete(self) {
+        self.release(buffers::Release::Released);
+    }
+}
+
+impl<'w, 'd, R: roles::Protocol + 'w, ID: route::Identity + 'w> reserve::Completion
+    for Transaction<'_, 'w, 'd, R, ID, buffers::Release>
+where
+    'd: 'w,
+{
+    fn complete(self) {
+        let recv = self.recv;
+        self.release(recv);
+    }
+}
+impl<R: roles::Protocol> reserve::Try<tls::Tls<R>> for Policy<R> {
+    type Block<'a, 'w, 'd, ID: route::Identity + 'w>
+        = Blocked<'a, 'd, ID>
+    where
+        tls::Tls<R>: 'w,
+        'd: 'w,
+        'w: 'a;
+    type Transaction<'a, 'w, 'd, ID: route::Identity + 'w>
+        = Transaction<'a, 'w, 'd, R, ID>
+    where
+        tls::Tls<R>: 'w,
+        'd: 'w,
+        'w: 'a;
+
+    /// Submitted ciphertext keeps its send owner until completion; receiving
+    /// defers new native TLS output to after_send, preserving wire order.
+    fn try_reserve<'a, 'w, 'd, ID: route::Identity + 'w>(
+        wire: &'a mut tls::Connection<'w, R, ID>,
+        send: &'a mut tls::SendState<'w>,
+        run: &'a mut endpoint::Runtime<'w, 'd, R, ID>,
+    ) -> reserve::Outcome<
+        Self::Transaction<'a, 'w, 'd, ID>,
+        Self::Block<'a, 'w, 'd, ID>,
+        terminal::Error<'w, tls::Tls<R>>,
+    >
+    where
+        tls::Tls<R>: 'w,
+        'd: 'w,
+        'w: 'a,
+    {
+        let open = wire.native.is_handshaking() && !wire.send_inflight;
+        let recv = match wire.buffers.try_reserve() {
+            Ok(Some(recv)) => recv,
+            Ok(None) => {
+                return reserve::Outcome::Blocked(Blocked {
+                    waiters: &mut run.waiters,
+                    kind: waiters::Resource::Recv,
+                });
+            }
+            Err(cause) => {
+                wire.failed = true;
+                return reserve::Outcome::Failed(terminal::Error::from_cause(
+                    error::Error::Allocation(cause.into()),
+                ));
+            }
+        };
+        if !open {
+            return reserve::Outcome::Ready(Transaction {
+                wire,
+                send: None,
+                run,
+                recv,
+            });
+        }
+        let Some(send) = send.reserve(wire.buffers.send_pool()) else {
+            drop(recv);
+            run.waiters.wake(waiters::Resource::Recv);
+            return reserve::Outcome::Blocked(Blocked {
+                waiters: &mut run.waiters,
+                kind: waiters::Resource::HandshakeEgress,
+            });
+        };
+        reserve::Outcome::Ready(Transaction {
+            wire,
+            send: Some(send),
+            run,
+            recv,
+        })
+    }
+    fn cancel<'w, 'd, ID: route::Identity + 'w>(
+        run: &mut endpoint::Runtime<'w, 'd, R, ID>,
+        target: credit::Id<'d, ID>,
+    ) where
+        tls::Tls<R>: 'w,
+        'd: 'w,
+    {
+        run.waiters.cancel(target);
+    }
+    fn release_recv<'w, 'd, ID: route::Identity + 'w>(run: &mut endpoint::Runtime<'w, 'd, R, ID>)
+    where
+        tls::Tls<R>: 'w,
+        'd: 'w,
+    {
+        run.waiters.wake(waiters::Resource::Recv);
+    }
+    fn release_send<'w, 'd, ID: route::Identity + 'w>(run: &mut endpoint::Runtime<'w, 'd, R, ID>)
+    where
+        tls::Tls<R>: 'w,
+        'd: 'w,
+    {
+        run.waiters.wake(waiters::Resource::HandshakeEgress);
+    }
+}
+impl<'a, 'd, R: roles::Protocol, ID: route::Identity> reserve::Wait<'d, ID, tls::Tls<R>>
+    for Blocked<'a, 'd, ID>
 {
     type Registration = waiters::Registration<'a, 'd, ID>;
-
-    fn register(self, credit: wire::RecvCredit<'d, ID>) -> Option<Self::Registration> {
-        self.runtime.waiters.register(self.resource, credit)
-    }
-}
-
-impl<'d, R: roles::Protocol, const ID: u8> receive::Transaction<'d, tls::Tls<R>>
-    for Transaction<'_, 'd, R, ID>
-{
-    fn process<'bytes>(
-        &mut self,
-        bytes: &'bytes mut [u8],
-        capacity: &batch::Capacity<tls::Tls<R>>,
-    ) -> <tls::Tls<R> as wire::Wire>::RecvBatch<'bytes>
-    where
-        'd: 'bytes,
-    {
-        match self {
-            Self::Handshake(transaction) => <tls::Tls<R> as wire::Wire>::process_recv(
-                transaction.wire,
-                transaction.runtime,
-                bytes,
-                capacity,
-            ),
-            Self::Established(transaction) => <tls::Tls<R> as wire::Wire>::process_recv(
-                transaction.wire,
-                transaction.runtime,
-                bytes,
-                capacity,
-            ),
-        }
-    }
-
-    fn process_retained<'bytes>(
-        &mut self,
-        bytes: recv::Lease<'bytes>,
-    ) -> Option<<tls::Tls<R> as wire::Wire>::RetainedRecv<'bytes>>
-    where
-        'd: 'bytes,
-    {
-        match self {
-            Self::Handshake(transaction) => <tls::Tls<R> as wire::Wire>::process_retained_recv(
-                transaction.wire,
-                transaction.runtime,
-                bytes,
-            ),
-            Self::Established(transaction) => <tls::Tls<R> as wire::Wire>::process_retained_recv(
-                transaction.wire,
-                transaction.runtime,
-                bytes,
-            ),
-        }
-    }
-}
-
-impl<R: roles::Protocol, const ID: u8> Drop for Transaction<'_, '_, R, ID> {
-    fn drop(&mut self) {
-        match self {
-            Self::Handshake(transaction) => {
-                state::Internals::swap_pending_buffer(
-                    &mut transaction.wire.state.tls,
-                    &mut transaction.send.buffer,
-                );
-                let recv =
-                    state::Internals::release_empty_recv_buffer(&mut transaction.wire.state.tls);
-                let send =
-                    transmissions::SendBuffer::release_if_empty(transaction.send).is_released();
-                if recv {
-                    transaction.runtime.waiters.wake(waiters::Resource::Recv);
-                }
-                if send {
-                    transaction
-                        .runtime
-                        .waiters
-                        .wake(waiters::Resource::HandshakeEgress);
-                }
-            }
-            Self::Established(transaction) => {
-                if state::Internals::release_empty_recv_buffer(&mut transaction.wire.state.tls) {
-                    transaction.runtime.waiters.wake(waiters::Resource::Recv);
-                }
-            }
-        }
+    fn register(
+        self,
+        credit: credit::Pending<'d, ID>,
+    ) -> Result<Self::Registration, entry::Error<conn::Capacity>> {
+        self.waiters.register(self.kind, credit)
     }
 }

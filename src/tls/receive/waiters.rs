@@ -1,92 +1,162 @@
-use dope::net::wire::{self, receive};
-use o3::collections::queue::slot;
+use o3::{
+    alloc,
+    depot::queue::tagged::{self, entry},
+};
+use std::mem;
 
-#[derive(Clone, Copy)]
-pub(crate) enum Resource {
+use dope::{
+    core::driver::{
+        receive::credit,
+        route::{self, table::conn},
+    },
+    net::wire::receive,
+};
+use o3::depot::queue::indexed::lanes;
+use receive::reserve;
+
+const RECV: usize = 0;
+const HANDSHAKE_EGRESS: usize = 1;
+const LANES: usize = 2;
+
+enum Proof<'a, 'd, ID: route::Identity> {
+    Recv(
+        tagged::Linked<
+            lanes::Position<'a, credit::Held<'d, ID>, LANES, RECV, conn::Capacity, true>,
+            lanes::Rollback,
+        >,
+    ),
+    HandshakeEgress(
+        tagged::Linked<
+            lanes::Position<
+                'a,
+                credit::Held<'d, ID>,
+                LANES,
+                HANDSHAKE_EGRESS,
+                conn::Capacity,
+                true,
+            >,
+            lanes::Rollback,
+        >,
+    ),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tls) enum Resource {
     Recv,
     HandshakeEgress,
 }
 
-pub struct Registration<'a, 'd, const ID: u8> {
-    waiters: &'a mut Queue<'d, ID>,
-    target: wire::RecvCreditId<'d, ID>,
-    pending: bool,
+pub struct Registration<'a, 'd, ID: route::Identity> {
+    proof: Option<Proof<'a, 'd, ID>>,
 }
 
-pub(crate) struct Queue<'d, const ID: u8> {
-    recv: slot::Fifo<wire::RecvCreditGuard<'d, ID>>,
-    handshake_egress: slot::Fifo<wire::RecvCreditGuard<'d, ID>>,
+pub(crate) struct Queue<'d, ID: route::Identity> {
+    waiters: lanes::Fifo<credit::Held<'d, ID>, LANES, conn::Capacity>,
 }
 
-impl<'d, const ID: u8> Queue<'d, ID> {
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self {
-            recv: slot::Fifo::with_capacity(capacity),
-            handshake_egress: slot::Fifo::with_capacity(capacity),
-        }
-    }
-
-    pub(crate) fn register(
-        &mut self,
-        resource: Resource,
-        credit: wire::RecvCredit<'d, ID>,
-    ) -> Option<Registration<'_, 'd, ID>> {
-        let target = credit.id();
-        {
-            let queue = self.queue(resource);
-            let vacant = queue.vacant_entry(target.index())?;
-            let guard = credit.claim().ok()?;
-            vacant.push_back(guard);
-        }
-        Some(Registration {
-            waiters: self,
-            target,
-            pending: true,
+impl<'d, ID: route::Identity> Queue<'d, ID> {
+    pub(crate) fn try_new(cap: conn::Capacity) -> Result<Self, alloc::Error> {
+        Ok(Self {
+            waiters: lanes::Fifo::try_from(cap)?,
         })
     }
 
-    pub(crate) fn wake(&mut self, resource: Resource) {
-        let Some(guard) = self.queue(resource).pop_front() else {
-            return;
+    pub(in crate::tls) fn register(
+        &mut self,
+        kind: Resource,
+        credit: credit::Pending<'d, ID>,
+    ) -> Result<Registration<'_, 'd, ID>, entry::Error<conn::Capacity>> {
+        let target = credit.id();
+        let proof = match kind {
+            Resource::Recv => {
+                let vacant = self
+                    .waiters
+                    .vacant::<RECV>(target.slot().index().into_usize())?;
+                let guard = credit.claim();
+                Proof::Recv(vacant.insert::<false>(guard))
+            }
+            Resource::HandshakeEgress => {
+                let vacant = self
+                    .waiters
+                    .vacant::<HANDSHAKE_EGRESS>(target.slot().index().into_usize())?;
+                let guard = credit.claim();
+                Proof::HandshakeEgress(vacant.insert::<false>(guard))
+            }
         };
-        guard.retry();
+        Ok(Registration { proof: Some(proof) })
     }
 
-    pub(crate) fn cancel(&mut self, target: wire::RecvCreditId<'d, ID>) {
-        let index = target.index();
-        Self::cancel_queue(&mut self.recv, index, target);
-        Self::cancel_queue(&mut self.handshake_egress, index, target);
+    pub(in crate::tls) fn take(&mut self, kind: Resource) -> Option<credit::Held<'d, ID>> {
+        match kind {
+            Resource::Recv => self.waiters.pop_front::<RECV>(),
+            Resource::HandshakeEgress => self.waiters.pop_front::<HANDSHAKE_EGRESS>(),
+        }
     }
 
-    fn cancel_queue(
-        queue: &mut slot::Fifo<wire::RecvCreditGuard<'d, ID>>,
-        index: usize,
-        target: wire::RecvCreditId<'d, ID>,
-    ) {
-        let Some(guard) = queue.remove_if(index, |guard| guard.id() == target) else {
+    pub(in crate::tls) fn wake(&mut self, kind: Resource) {
+        if let Some(guard) = self.take(kind) {
+            guard.retry();
+        }
+    }
+
+    pub(in crate::tls) fn has_waiters(&self, kind: Resource) -> bool {
+        match kind {
+            Resource::Recv => !tagged::Endpoint::constant::<RECV>(&self.waiters).is_empty(),
+            Resource::HandshakeEgress => {
+                !tagged::Endpoint::constant::<HANDSHAKE_EGRESS>(&self.waiters).is_empty()
+            }
+        }
+    }
+
+    pub(crate) fn cancel(&mut self, target: credit::Id<'d, ID>) {
+        let index = target.slot().index().into_usize();
+        let Some(guard) = self.waiters.remove_if(index, |guard| guard.id() == target) else {
             return;
         };
         guard.cancel();
     }
-
-    fn queue(&mut self, resource: Resource) -> &mut slot::Fifo<wire::RecvCreditGuard<'d, ID>> {
-        match resource {
-            Resource::Recv => &mut self.recv,
-            Resource::HandshakeEgress => &mut self.handshake_egress,
-        }
-    }
 }
 
-impl<const ID: u8> receive::Registration for Registration<'_, '_, ID> {
+impl<ID: route::Identity> reserve::Registration for Registration<'_, '_, ID> {
     fn commit(mut self) {
-        self.pending = false;
-    }
-}
-
-impl<const ID: u8> Drop for Registration<'_, '_, ID> {
-    fn drop(&mut self) {
-        if self.pending {
-            self.waiters.cancel(self.target);
+        if let Some(proof) = self.proof.take() {
+            proof.commit();
         }
     }
 }
+
+impl<ID: route::Identity> Drop for Registration<'_, '_, ID> {
+    fn drop(&mut self) {
+        if let Some(proof) = self.proof.take() {
+            proof.remove().cancel();
+        }
+    }
+}
+
+impl<'a, 'd, ID: route::Identity> Proof<'a, 'd, ID> {
+    fn commit(self) {
+        match self {
+            Self::Recv(proof) => proof.commit(),
+            Self::HandshakeEgress(proof) => proof.commit(),
+        }
+    }
+
+    fn remove(self) -> credit::Held<'d, ID> {
+        match self {
+            Self::Recv(proof) => proof.remove(),
+            Self::HandshakeEgress(proof) => proof.remove(),
+        }
+    }
+}
+
+const _: () = {
+    assert!(
+        mem::size_of::<Queue<'_, route::KeyTag<0>>>()
+            == 2 * mem::size_of::<usize>() + LANES * 2 * mem::size_of::<u32>()
+    );
+    assert!(mem::size_of::<Proof<'_, '_, route::KeyTag<0>>>() == 3 * mem::size_of::<usize>());
+    assert!(
+        mem::size_of::<Registration<'_, '_, route::KeyTag<0>>>()
+            == mem::size_of::<Proof<'_, '_, route::KeyTag<0>>>()
+    );
+};
