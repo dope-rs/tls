@@ -102,7 +102,7 @@ impl<T: ?Sized + Sync> Local<u16> for T {
 }
 
 #[test]
-fn ownership_contracts() {
+fn ownership_contracts() -> Result<(), dope_test::checks::Error> {
     use dope::core::driver::route::KeyTag;
     use dope_tls::config::raw::Identity;
     use dope_tls::tls::{
@@ -123,31 +123,16 @@ fn ownership_contracts() {
     let _: <SendState<'static> as Local<_>>::Proof;
     let _: <Retained<'static, 'static> as Local<_>>::Proof;
 
-    use std::env;
-
-    use dope_test::checks::Suite;
-    let suite = Suite::new(
+    let exe = std::env::current_exe()?;
+    let suite = dope_test::checks::Suite::new(
         env!("CARGO_MANIFEST_DIR"),
         file!(),
         &["dope-tls", "dope", "o3"],
     );
-    let exe = env::current_exe().expect("test executable");
-    let status = suite
-        .try_build(&exe, env!("CARGO_PKG_NAME"))
-        .expect("build command")
-        .status()
-        .expect("build original library");
-    assert!(status.success(), "build original library: {status}");
-    assert_eq!(
-        suite
-            .try_errors(&exe, include_str!("contracts.rs"))
-            .expect("exact compiler errors"),
-        4
-    );
-    let status = suite
-        .try_rustdoc(&exe)
-        .expect("rustdoc command")
-        .status()
-        .expect("compiler contracts");
+    let output = suite.try_build(&exe, env!("CARGO_PKG_NAME"))?.output()?;
+    let artifacts = suite.try_collect(&exe, output)?;
+    assert_eq!(artifacts.try_errors(include_str!("contracts.rs"))?, 4);
+    let status = artifacts.try_rustdoc()?.status()?;
     assert!(status.success(), "TLS ownership contracts: {status}");
+    Ok(())
 }

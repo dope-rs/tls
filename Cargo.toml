@@ -1,6 +1,6 @@
 [package]
 name = "dope-tls"
-version = "0.20.1"
+version = "0.21.0"
 edition = "2024"
 rust-version = "1.98"
 description = "TCP TLS streams for dope runtime, rustls-backed"
@@ -13,14 +13,14 @@ test = false
 
 [dependencies]
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "aws_lc_rs"] }
-dope = "0.20.0"
-o3 = "=0.20.0"
+dope = "0.21"
+o3 = "0.20"
 webpki-roots = "1.0.10"
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
-dope-fiber = "0.20.0"
-dope-test = "0.20.0"
+dope-fiber = "0.21"
+dope-test = "0.21"
 pin-project = "1"
 
 [profile.release]

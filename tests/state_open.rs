@@ -61,12 +61,15 @@ fn reuses_hello() {
             _ => None,
         }
         .expect("reuse admitted connection");
-    let txn =
-        match Policy::<roles::Client>::try_reserve::<KeyTag<0>>(&mut wire, &mut send, &mut run) {
-            Outcome::Ready(txn) => Some(txn),
-            _ => None,
-        }
-        .expect("reuse queued client hello");
+    let txn = match Policy::<roles::Client>::try_reserve::<KeyTag<0>>(
+        &mut wire,
+        Some(&mut send),
+        &mut run,
+    ) {
+        Outcome::Ready(txn) => Some(txn),
+        _ => None,
+    }
+    .expect("reuse queued client hello");
     drop(txn);
     assert_eq!(send.as_slice(), hello);
     assert!(matches!(
@@ -199,8 +202,11 @@ fn pool_return() {
     }
     for complete in [true, false] {
         for (wire, send) in &mut opened {
-            let txn = match Policy::<roles::Server>::try_reserve::<KeyTag<0>>(wire, send, &mut run)
-            {
+            let txn = match Policy::<roles::Server>::try_reserve::<KeyTag<0>>(
+                wire,
+                Some(&mut *send),
+                &mut run,
+            ) {
                 Outcome::Ready(txn) => Some(txn),
                 _ => None,
             }
@@ -241,7 +247,9 @@ fn cancelled_waiter() {
                     .expect("handshaking client");
                 send.consume_max(Len::MAX);
                 let txn = match Policy::<roles::Client>::try_reserve::<KeyTag<0>>(
-                    &mut wire, &mut send, &mut run,
+                    &mut wire,
+                    Some(&mut send),
+                    &mut run,
                 ) {
                     Outcome::Ready(txn) => Some(txn),
                     _ => None,
@@ -273,12 +281,15 @@ fn cancelled_waiter() {
                 .iter_mut()
                 .zip(indices.into_iter().zip(targets).zip(&ready))
             {
-                let blocked =
-                    match Policy::<roles::Client>::try_reserve::<KeyTag<0>>(wire, send, &mut run) {
-                        Outcome::Blocked(blocked) => Some(blocked),
-                        _ => None,
-                    }
-                    .expect("both handshakes wait for the shared send buffer");
+                let blocked = match Policy::<roles::Client>::try_reserve::<KeyTag<0>>(
+                    wire,
+                    Some(&mut *send),
+                    &mut run,
+                ) {
+                    Outcome::Blocked(blocked) => Some(blocked),
+                    _ => None,
+                }
+                .expect("both handshakes wait for the shared send buffer");
                 let pending = credits
                     .get(slot)
                     .expect("credit slot")
@@ -313,7 +324,9 @@ fn cancelled_waiter() {
                 Take::Ready(Wake::Retry)
             ));
             let txn = match Policy::<roles::Client>::try_reserve::<KeyTag<0>>(
-                &mut wire, &mut send, &mut run,
+                &mut wire,
+                Some(&mut send),
+                &mut run,
             ) {
                 Outcome::Ready(txn) => Some(txn),
                 _ => None,

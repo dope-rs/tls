@@ -141,7 +141,7 @@ impl<R: roles::Protocol> reserve::Try<tls::Tls<R>> for Policy<R> {
     /// defers new native TLS output to after_send, preserving wire order.
     fn try_reserve<'a, 'w, 'd, ID: route::Identity + 'w>(
         wire: &'a mut tls::Connection<'w, R, ID>,
-        send: &'a mut tls::SendState<'w>,
+        send: Option<&'a mut tls::SendState<'w>>,
         run: &'a mut endpoint::Runtime<'w, 'd, R, ID>,
     ) -> reserve::Outcome<
         Self::Transaction<'a, 'w, 'd, ID>,
@@ -169,14 +169,14 @@ impl<R: roles::Protocol> reserve::Try<tls::Tls<R>> for Policy<R> {
                 ));
             }
         };
-        if !open {
+        let (true, Some(send)) = (open, send) else {
             return reserve::Outcome::Ready(Transaction {
                 wire,
                 send: None,
                 run,
                 recv,
             });
-        }
+        };
         let Some(send) = send.reserve(wire.buffers.send_pool()) else {
             drop(recv);
             run.waiters.wake(waiters::Resource::Recv);
