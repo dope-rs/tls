@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{convert::Infallible, io, sync::Arc};
+use std::{io, sync::Arc};
 
 use common::{
     Read,
@@ -159,9 +159,7 @@ fn cloned_plan_policy() {
                         assert!(matches!(result, Ok(Ok(()))), "client shutdown");
                     }, recovery::Policy::new(
                         |report| reports.push(report),
-                        |failure: recovery::Recovery<'_, '_>| -> Infallible {
-                            panic!("native recovery: {:?}", failure.cause())
-                        },
+                        common::recover,
                     ));
                     assert!(result.is_ok(), "client route");
                 });

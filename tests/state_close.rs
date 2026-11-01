@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{cell::Cell, convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{cell::Cell, net::SocketAddr, sync::Arc};
 
 use dope::{
     core::{
@@ -175,7 +175,7 @@ fn run(mode: Mode, body: Vec<u8>, direct: usize) -> (Vec<u8>, Records) {
                 );
                 assert!(result.is_ok(), "listener installation");
             },
-            recovery::Policy::new(|report| reports.push(report), recover),
+            recovery::Policy::new(|report| reports.push(report), common::recover),
         );
         assert!(
             reports
@@ -203,8 +203,4 @@ fn run(mode: Mode, body: Vec<u8>, direct: usize) -> (Vec<u8>, Records) {
         assert_eq!(eofs.get(), 1, "receive EOF must be delivered exactly once");
     }
     output.expect("native reply")
-}
-
-fn recover(failure: recovery::Recovery<'_, '_>) -> Infallible {
-    panic!("native recovery: {:?}", failure.cause())
 }

@@ -1,5 +1,4 @@
 use std::{
-    convert::Infallible,
     io::{self, Read as _, Write as _},
     sync::Arc,
 };
@@ -155,9 +154,7 @@ fn reconnects() {
                         assert!(matches!(result, Ok(Ok(()))), "client machine and shutdown");
                     }, recovery::Policy::new(
                         |report| reports.push(report),
-                        |failure: recovery::Recovery<'_, '_>| -> Infallible {
-                            panic!("native recovery: {:?}", failure.cause())
-                        },
+                        common::recover,
                     ));
                     assert!(reports.events().expect("reclamation observations").is_empty(),
                         "unexpected reclaimed completions: {reports:?}");

@@ -2,7 +2,6 @@ use dope::core::driver::life::recovery;
 use dope::core::driver::route::KeyTag;
 use dope_tls::tls::Tls;
 use dope_tls::tls::roles::Server;
-use std::convert::Infallible;
 type Wire = Tls<Server>;
 use crate::common::fiber::Bound;
 use dope::core::driver::life::creation::Attempt;
@@ -225,7 +224,7 @@ fn assert_end(input: Input) {
                     assert!(result.is_ok(), "TLS listener must be adopted");
                     assert!(rejected.is_empty(), "TLS open failed");
                 },
-                recovery::Policy::new(|report| reports.push(report), recover),
+                recovery::Policy::new(|report| reports.push(report), common::recover),
             );
             assert!(
                 reports.events().expect("reclamation observations").is_empty(),
@@ -244,8 +243,4 @@ fn data_precedes_record() {
 #[test]
 fn data_precedes_truncation() {
     assert_end(Input::Truncated);
-}
-
-fn recover(failure: recovery::Recovery<'_, '_>) -> Infallible {
-    panic!("native recovery: {:?}", failure.cause())
 }

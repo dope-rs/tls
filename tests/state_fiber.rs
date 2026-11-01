@@ -8,7 +8,6 @@ use dope::core::driver::life::recovery;
 use dope::core::driver::settings::claim::Needs;
 use dope::runtime::executor::session::Completion;
 use dope_test::harness::scenario::TIMEOUT;
-use std::convert::Infallible;
 use std::iter;
 pub mod common;
 
@@ -138,7 +137,7 @@ fn records_share_cursors() {
                 );
                 assert!(result.is_ok(), "TLS listener must be adopted");
                 assert!(rejected.is_empty(), "TLS open failed");
-            }, recovery::Policy::new(|report| reports.push(report), recover));
+            }, recovery::Policy::new(|report| reports.push(report), common::recover));
             assert!(
                 reports.events().expect("reclamation observations").is_empty(),
                 "unexpected reclaimed completions: {reports:?}"
@@ -146,8 +145,4 @@ fn records_share_cursors() {
             assert!(entered.is_ok(), "listener port storage");
         });
     }
-}
-
-fn recover(failure: recovery::Recovery<'_, '_>) -> Infallible {
-    panic!("native recovery: {:?}", failure.cause())
 }

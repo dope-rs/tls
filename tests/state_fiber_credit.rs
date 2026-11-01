@@ -1,4 +1,4 @@
-use std::{convert::Infallible, num::NonZero, sync::mpsc, time::Duration};
+use std::{num::NonZero, sync::mpsc, time::Duration};
 
 use dope::core::driver::{
     life::{creation::Attempt, recovery},
@@ -465,7 +465,7 @@ fn run_credit(body: &'static [u8], recv: Receive, joined: bool, fail: bool, esca
                 assert!(result.is_ok(), "TLS listener must be adopted");
                 assert!(rejected.is_empty(), "TLS open failed");
             },
-            recovery::Policy::new(|report| reports.push(report), recover),
+            recovery::Policy::new(|report| reports.push(report), common::recover),
         );
         assert!(
             reports
@@ -476,10 +476,6 @@ fn run_credit(body: &'static [u8], recv: Receive, joined: bool, fail: bool, esca
         );
         assert!(entered.is_ok(), "listener port storage");
     });
-}
-
-fn recover(failure: recovery::Recovery<'_, '_>) -> Infallible {
-    panic!("native recovery: {:?}", failure.cause())
 }
 
 #[global_allocator]

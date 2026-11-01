@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{convert::Infallible, io, io::Write as _, sync::Arc, time::Duration};
+use std::{io, io::Write as _, sync::Arc, time::Duration};
 
 use common::{Read, Signer, fiber::client::Client, state, times::Fixed};
 use dope::core::driver::{
@@ -138,9 +138,7 @@ fn clones_resume() {
                         },
                         recovery::Policy::new(
                             |report| reports.push(report),
-                            |failure: recovery::Recovery<'_, '_>| -> Infallible {
-                                panic!("native recovery: {:?}", failure.cause())
-                            },
+                            common::recover,
                         ),
                     );
                     assert!(result.is_ok(), "client route");

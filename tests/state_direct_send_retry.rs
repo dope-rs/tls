@@ -1,6 +1,6 @@
 pub mod common;
 
-use std::{cell::Cell, convert::Infallible, num::NonZero, sync::Arc};
+use std::{cell::Cell, num::NonZero, sync::Arc};
 
 use dope::{
     core::{
@@ -190,7 +190,7 @@ fn released_direct() {
                 );
                 assert!(result.is_ok(), "listener installation");
             },
-            recovery::Policy::new(|report| reports.push(report), recover),
+            recovery::Policy::new(|report| reports.push(report), common::recover),
         );
         assert!(
             reports
@@ -210,8 +210,4 @@ fn released_direct() {
     assert!(peers.values().expect("peer observations").is_empty());
     assert_eq!(copies.take(), None);
     assert_eq!(eofs.get(), 0);
-}
-
-fn recover(failure: recovery::Recovery<'_, '_>) -> Infallible {
-    panic!("native recovery: {:?}", failure.cause())
 }

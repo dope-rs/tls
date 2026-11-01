@@ -21,7 +21,6 @@ use crate::{
 };
 
 pub mod client;
-mod egress;
 pub mod endpoint;
 #[doc(hidden)]
 pub mod protocol;

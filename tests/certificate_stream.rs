@@ -20,7 +20,6 @@ use dope_fiber::{
 use dope_test::harness::{peer::TcpScript, scenario::TIMEOUT};
 use dope_tls::tls::{Tls, endpoint, roles};
 use rustls::{AlertDescription, Error};
-use std::convert::Infallible;
 use std::sync::Arc;
 
 #[test]
@@ -62,7 +61,7 @@ fn endpoint_reports_cause() {
                     })
                 });
                 assert!(matches!(result, Ok(Ok(()))), "TLS machine must retire all connection owners");
-            }, recovery::Policy::new(|report| reports.push(report), recover));
+            }, recovery::Policy::new(|report| reports.push(report), common::recover));
             assert!(result.is_ok(), "TLS route must finish cleanly");
         });
         assert!(
@@ -77,8 +76,4 @@ fn endpoint_reports_cause() {
         assert_eq!(cause, Error::AlertReceived(expected));
     }).expect("certificate peer started");
     }
-}
-
-fn recover(failure: recovery::Recovery<'_, '_>) -> Infallible {
-    panic!("native recovery: {:?}", failure.cause());
 }
